@@ -184,8 +184,13 @@ def _extract_tgz(archive_path: Path, dst_dir: Path) -> None:
     if marker_dir.is_dir() and (marker_dir / "train").is_dir() and (marker_dir / "val").is_dir():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_root = dst_dir.resolve()
     with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(path=dst_dir)
+        for member in tar.getmembers():
+            member_target = (dst_root / member.name).resolve()
+            if member_target != dst_root and dst_root not in member_target.parents:
+                raise RuntimeError(f"Refusing to extract '{member.name}' outside '{dst_root}'")
+        tar.extractall(path=dst_root)
 
 
 
@@ -868,8 +873,8 @@ class FlattenedMuon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g, memory_format=torch.preserve_format)
                 buf = state["momentum_buffer"]
 
-                buf.lerp_(g, 1 - momentum)
-                update = g.lerp(buf, momentum) if nesterov else buf
+                buf.mul_(momentum).add_(g)
+                update = g.add(buf, alpha=momentum) if nesterov else buf
                 update_2d = update if update.ndim == 2 else update.reshape(update.shape[0], -1)
 
                 ortho_2d = muon_quintic_ns(
@@ -1009,8 +1014,8 @@ class KFACReduce:
             buf = torch.zeros_like(grad_2d)
             state["momentum_buffer"] = buf
 
-        buf.lerp_(grad_2d, 1.0 - momentum)
-        return grad_2d.lerp(buf, momentum) if self.cfg.nesterov else buf
+        buf.mul_(momentum).add_(grad_2d)
+        return grad_2d.add(buf, alpha=momentum) if self.cfg.nesterov else buf
 
     def _adjust_step_lr(self, lr: float, matrix_shape: tuple[int, int]) -> float:
         if self.cfg.lr_adjustment == "none":

@@ -153,8 +153,13 @@ def _extract_tgz(archive_path: Path, dst_dir: Path) -> None:
     if marker_dir.is_dir() and (marker_dir / "train").is_dir() and (marker_dir / "val").is_dir():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_root = dst_dir.resolve()
     with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(path=dst_dir)
+        for member in tar.getmembers():
+            member_target = (dst_root / member.name).resolve()
+            if member_target != dst_root and dst_root not in member_target.parents:
+                raise RuntimeError(f"Refusing to extract '{member.name}' outside '{dst_root}'")
+        tar.extractall(path=dst_root)
 
 
 def resolve_imagenette_root(root: str) -> str:
@@ -233,13 +238,14 @@ def make_imagenette_loaders(
     train_ds = maybe_subset_dataset(train_ds, train_subset, seed=seed)
     val_ds = maybe_subset_dataset(val_ds, val_subset, seed=seed + 1)
 
+    train_drop_last = len(train_ds) >= batch_size
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=train_drop_last,
         persistent_workers=(num_workers > 0),
     )
     val_loader = torch.utils.data.DataLoader(
@@ -450,11 +456,18 @@ class VisionTransformer(nn.Module):
         return self.head(self.forward_features(x))
 
 
-def build_vit(model_name: str = "small", num_classes: int = IMAGENETTE_NUM_CLASSES, pool: str = "mean") -> VisionTransformer:
+def build_vit(
+    model_name: str = "small",
+    *,
+    image_size: int = 224,
+    patch_size: int = 16,
+    num_classes: int = IMAGENETTE_NUM_CLASSES,
+    pool: str = "mean",
+) -> VisionTransformer:
     if model_name == "tiny":
         return VisionTransformer(
-            image_size=224,
-            patch_size=16,
+            image_size=image_size,
+            patch_size=patch_size,
             num_classes=num_classes,
             embed_dim=192,
             depth=12,
@@ -468,8 +481,8 @@ def build_vit(model_name: str = "small", num_classes: int = IMAGENETTE_NUM_CLASS
         )
     if model_name == "small":
         return VisionTransformer(
-            image_size=224,
-            patch_size=16,
+            image_size=image_size,
+            patch_size=patch_size,
             num_classes=num_classes,
             embed_dim=384,
             depth=12,
@@ -615,8 +628,8 @@ class FlattenedMuon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g, memory_format=torch.preserve_format)
                 buf = state["momentum_buffer"]
 
-                buf.lerp_(g, 1 - momentum)
-                update = g.lerp(buf, momentum) if nesterov else buf
+                buf.mul_(momentum).add_(g)
+                update = g.add(buf, alpha=momentum) if nesterov else buf
                 update_2d = update if update.ndim == 2 else update.reshape(update.shape[0], -1)
 
                 ortho_2d = muon_quintic_ns(
@@ -756,8 +769,8 @@ class KFACReduce:
             buf = torch.zeros_like(grad_2d)
             state["momentum_buffer"] = buf
 
-        buf.lerp_(grad_2d, 1.0 - momentum)
-        return grad_2d.lerp(buf, momentum) if self.cfg.nesterov else buf
+        buf.mul_(momentum).add_(grad_2d)
+        return grad_2d.add(buf, alpha=momentum) if self.cfg.nesterov else buf
 
     def _adjust_step_lr(self, lr: float, matrix_shape: tuple[int, int]) -> float:
         if self.cfg.lr_adjustment == "none":
@@ -945,6 +958,10 @@ def validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError(f"eval_every must be positive, got {cfg.eval_every}")
     if cfg.steps <= 0:
         raise ValueError(f"steps must be positive, got {cfg.steps}")
+    if cfg.image_size <= 0:
+        raise ValueError(f"image_size must be positive, got {cfg.image_size}")
+    if cfg.image_size % 16 != 0:
+        raise ValueError(f"image_size must be divisible by patch_size=16, got image_size={cfg.image_size}")
     if not 0.0 <= cfg.muon_momentum < 1.0:
         raise ValueError(f"muon_momentum must be in [0, 1), got {cfg.muon_momentum}")
     if not 0.0 <= cfg.kfac_momentum < 1.0:
@@ -988,9 +1005,19 @@ def train(cfg: TrainConfig) -> list[dict]:
         val_subset=cfg.val_subset,
         seed=cfg.seed,
     )
+    if len(train_loader) == 0:
+        raise ValueError(
+            f"Train loader has zero batches. Increase train_subset or lower batch_size (batch_size={cfg.batch_size})."
+        )
     train_iter = cycle(train_loader)
 
-    model = build_vit(model_name=cfg.model_name, num_classes=IMAGENETTE_NUM_CLASSES, pool=cfg.pool).to(device)
+    model = build_vit(
+        model_name=cfg.model_name,
+        image_size=cfg.image_size,
+        patch_size=16,
+        num_classes=IMAGENETTE_NUM_CLASSES,
+        pool=cfg.pool,
+    ).to(device)
     muon_modules, muon_params, aux_params = split_muon_and_aux(model, exclude_first_last=True)
 
     aux_lr = cfg.lr if cfg.aux_lr is None else cfg.aux_lr
