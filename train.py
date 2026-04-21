@@ -19,15 +19,19 @@ import copy
 import importlib
 import json
 import logging
+import math
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.utils
 import yaml
 
@@ -186,7 +190,7 @@ group.add_argument('--device-modules', default=None, type=str, nargs='+',
 # Optimizer parameters
 group = parser.add_argument_group('Optimizer parameters')
 group.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
-                   help='Optimizer (default: "sgd")')
+                   help='Optimizer (default: "sgd"). Includes "kfac_muon" for reduce-style KFAC-Muon.')
 group.add_argument('--opt-eps', default=None, type=float, metavar='EPSILON',
                    help='Optimizer Epsilon (default: None, use opt default)')
 group.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
@@ -206,6 +210,44 @@ group.add_argument('--layer-decay-min-scale', type=float, default=0,
 group.add_argument('--layer-decay-no-opt-scale', type=float, default=None,
                    help='layer-wise lr decay no optimization scale (default: None)')
 group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwargs)
+group.add_argument('--kfac-damping', type=float, default=1e-3,
+                   help='KFAC damping for --opt kfac_muon (default: 1e-3)')
+group.add_argument('--kfac-ema-decay', type=float, default=0.95,
+                   help='EMA decay for KFAC statistics for --opt kfac_muon (default: 0.95)')
+group.add_argument('--kfac-stats-update-every', type=int, default=20,
+                   help='Update KFAC stats every N optimizer steps for --opt kfac_muon (default: 20)')
+group.add_argument('--kfac-factor-update-every', type=int, default=20,
+                   help='Update KFAC factors every N optimizer steps for --opt kfac_muon (default: 20)')
+group.add_argument('--kfac-momentum', type=float, default=0.95,
+                   help='Momentum used before KFAC preconditioning for --opt kfac_muon (default: 0.95)')
+group.add_argument('--kfac-nesterov', dest='kfac_nesterov', action='store_true',
+                   help='Enable Nesterov momentum for --opt kfac_muon')
+group.add_argument('--no-kfac-nesterov', dest='kfac_nesterov', action='store_false',
+                   help='Disable Nesterov momentum for --opt kfac_muon')
+group.add_argument('--kfac-muon-eps', type=float, default=0.1,
+                   help='Scale for Muon orthogonalized KFAC step for --opt kfac_muon (default: 0.1)')
+group.add_argument('--kfac-muon-ns-steps', type=int, default=5,
+                   help='Newton-Schulz iterations for Muon in --opt kfac_muon (default: 5)')
+group.add_argument('--kfac-muon-ns-eps', type=float, default=1e-7,
+                   help='Numerical epsilon for Muon Newton-Schulz in --opt kfac_muon (default: 1e-7)')
+group.add_argument('--kfac-muon-lr-adjustment', type=str, default='none',
+                   choices=['none', 'original', 'match_rms_adamw'],
+                   help='Muon LR adjustment mode inside KFAC for --opt kfac_muon (default: none)')
+group.add_argument('--kfac-max-step-norm', type=float, default=None,
+                   help='Optional global norm cap for KFAC steps for --opt kfac_muon')
+group.add_argument('--kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_true',
+                   help='Exclude first and last affine layers from KFAC-Muon set (default: enabled)')
+group.add_argument('--no-kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_false',
+                   help='Include first and last affine layers in KFAC-Muon set')
+group.add_argument('--kfac-aux-no-decay', dest='kfac_aux_no_decay', action='store_true',
+                   help='Use no-weight-decay rules for auxiliary AdamW params in --opt kfac_muon (default: enabled)')
+group.add_argument('--no-kfac-aux-no-decay', dest='kfac_aux_no_decay', action='store_false',
+                   help='Apply weight decay to all auxiliary AdamW params in --opt kfac_muon')
+parser.set_defaults(
+    kfac_nesterov=True,
+    kfac_exclude_first_last=True,
+    kfac_aux_no_decay=True,
+)
 
 # Learning rate schedule parameters
 group = parser.add_argument_group('Learning rate schedule parameters')
@@ -434,6 +476,579 @@ parser.add_argument('--kd-token-distill-type', default='soft', type=str, choices
                     help='Token distillation type: "soft" for KL-div with temperature, "hard" for CE with teacher argmax (default: soft)')
 
 
+def _is_image_folder_style_dataset(name: str) -> bool:
+    if not name:
+        return True
+    name = name.lower()
+    if name in ('image_folder', 'imagefolder', 'folder'):
+        return True
+    if '/' not in name:
+        return False
+    ds_type, _ = name.split('/', 1)
+    return ds_type in ('image_folder', 'imagefolder', 'folder')
+
+
+def _maybe_apply_image_folder_defaults(args) -> None:
+    if not args.data_dir or not _is_image_folder_style_dataset(args.dataset):
+        return
+
+    if args.val_split == 'validation':
+        val_dir = os.path.join(args.data_dir, 'val')
+        validation_dir = os.path.join(args.data_dir, 'validation')
+        if os.path.isdir(val_dir) and not os.path.isdir(validation_dir):
+            args.val_split = 'val'
+            _logger.info('Auto-selected --val-split=val (found "<data-dir>/val").')
+
+    if args.num_classes is None:
+        train_dir = os.path.join(args.data_dir, args.train_split)
+        if os.path.isdir(train_dir):
+            class_count = sum(1 for entry in os.scandir(train_dir) if entry.is_dir())
+            if class_count > 0:
+                args.num_classes = class_count
+                _logger.info(
+                    f'Auto-selected --num-classes={class_count} from folder layout at {train_dir}.'
+                )
+
+
+def _candidate_affine_modules(model: nn.Module) -> list[nn.Module]:
+    modules = []
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            if module.weight is not None and module.weight.requires_grad:
+                modules.append(module)
+        elif isinstance(module, nn.Conv2d):
+            if module.weight is not None and module.weight.requires_grad and module.groups == 1:
+                modules.append(module)
+    return modules
+
+
+def _split_muon_and_aux_params(
+        model: nn.Module,
+        exclude_first_last: bool = True,
+) -> tuple[list[nn.Module], list[nn.Parameter], list[nn.Parameter]]:
+    affine_modules = _candidate_affine_modules(model)
+    if exclude_first_last and len(affine_modules) >= 2:
+        muon_modules = affine_modules[1:-1]
+    else:
+        muon_modules = affine_modules
+
+    muon_param_ids = {id(module.weight) for module in muon_modules}
+    muon_params = []
+    aux_params = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in muon_param_ids:
+            muon_params.append(param)
+        else:
+            aux_params.append(param)
+    return muon_modules, muon_params, aux_params
+
+
+def _use_no_weight_decay(name: str, param: nn.Parameter) -> bool:
+    if param.ndim <= 1:
+        return True
+    if name == 'pos_embed' or name.endswith('.pos_embed'):
+        return True
+    if name == 'cls_token' or name.endswith('.cls_token'):
+        return True
+    return False
+
+
+def _build_aux_adamw_param_groups(
+        model: nn.Module,
+        muon_params: list[nn.Parameter],
+        weight_decay: float,
+) -> list[dict]:
+    muon_param_ids = {id(param) for param in muon_params}
+    seen = set()
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad or id(param) in muon_param_ids or id(param) in seen:
+            continue
+        seen.add(id(param))
+        if _use_no_weight_decay(name, param):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    param_groups = []
+    if decay_params:
+        param_groups.append({'params': decay_params, 'weight_decay': weight_decay})
+    if no_decay_params:
+        param_groups.append({'params': no_decay_params, 'weight_decay': 0.0})
+    return param_groups
+
+
+def _muon_quintic_ns(
+        matrix: torch.Tensor,
+        ns_steps: int = 5,
+        ns_coefficients=(3.4445, -4.775, 2.0315),
+        eps: float = 1e-7,
+) -> torch.Tensor:
+    a, b, c = ns_coefficients
+    original_dtype = matrix.dtype
+    y = matrix.float()
+    transposed = False
+    if y.shape[-2] > y.shape[-1]:
+        y = y.transpose(-2, -1)
+        transposed = True
+
+    y = y / (y.square().sum(dim=(-2, -1), keepdim=True).sqrt() + eps)
+    for _ in range(ns_steps):
+        ay = y @ y.transpose(-2, -1)
+        by = b * ay + c * (ay @ ay)
+        y = a * y + by @ y
+
+    if transposed:
+        y = y.transpose(-2, -1)
+    return y.to(original_dtype)
+
+
+def _adjust_muon_lr(lr: float, matrix_shape: tuple[int, int], mode: str) -> float:
+    rows, cols = matrix_shape
+    if mode == 'original':
+        return lr * math.sqrt(max(1.0, rows / cols))
+    if mode == 'match_rms_adamw':
+        return lr * (0.2 * math.sqrt(max(rows, cols)))
+    if mode == 'none':
+        return lr
+    raise ValueError(f'Unknown Muon LR adjustment mode: {mode}')
+
+
+@dataclass
+class _KFACConfig:
+    damping: float = 1e-3
+    ema_decay: float = 0.95
+    stats_update_every: int = 20
+    factor_update_every: int = 20
+    momentum: float = 0.95
+    nesterov: bool = True
+    muon_eps: float = 0.1
+    muon_ns_steps: int = 5
+    muon_ns_eps: float = 1e-7
+    muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315)
+    lr_adjustment: str = 'none'
+    weight_decay: float = 0.0
+    max_step_norm: Optional[float] = None
+
+
+class _KFACReduce:
+    def __init__(self, modules: list[nn.Module], cfg: _KFACConfig):
+        self.modules = list(modules)
+        self.cfg = cfg
+        self._cache = {module: {} for module in self.modules}
+        self._hooks = []
+        self._step = 0
+        self.stats = {}
+        self.factors = {}
+        self.eye_a = {}
+        self.eye_g = {}
+        self.state = {module: {} for module in self.modules}
+        self._init_buffers()
+        self._register_hooks()
+
+    @staticmethod
+    def _weight_matrix_shape(module: nn.Module) -> tuple[int, int]:
+        if isinstance(module, nn.Linear):
+            return module.out_features, module.in_features
+        if isinstance(module, nn.Conv2d):
+            if module.groups != 1:
+                raise NotImplementedError('KFACReduce only supports Conv2d with groups=1.')
+            if isinstance(module.kernel_size, tuple):
+                kernel_h, kernel_w = module.kernel_size
+            else:
+                kernel_h = kernel_w = module.kernel_size
+            return module.out_channels, module.in_channels * kernel_h * kernel_w
+        raise TypeError(f'Unsupported module type: {type(module)}')
+
+    def _init_buffers(self) -> None:
+        if not self.modules:
+            return
+        device = next(self.modules[0].parameters()).device
+        dtype = torch.float32
+        root = math.sqrt(max(self.cfg.damping, 0.0))
+        for module in self.modules:
+            out_dim, in_dim = self._weight_matrix_shape(module)
+            a0 = torch.eye(in_dim, device=device, dtype=dtype)
+            g0 = torch.eye(out_dim, device=device, dtype=dtype)
+            ia = torch.eye(in_dim, device=device, dtype=dtype)
+            ig = torch.eye(out_dim, device=device, dtype=dtype)
+            la = torch.linalg.cholesky(a0 + root * ia)
+            lg = torch.linalg.cholesky(g0 + root * ig)
+            self.stats[module] = {'A': a0, 'G': g0}
+            self.factors[module] = {'LA': la, 'LG': lg}
+            self.eye_a[module] = ia
+            self.eye_g[module] = ig
+
+    def _register_hooks(self) -> None:
+        self._hooks = []
+
+        def fwd_hook(module: nn.Module, inputs, output):
+            activations = inputs[0].detach()
+            self._cache[module]['a'] = activations
+            self._cache[module]['g'] = None
+            if output.requires_grad:
+                def store_grad(grad_out: torch.Tensor):
+                    self._cache[module]['g'] = grad_out.detach()
+                output.register_hook(store_grad)
+
+        for module in self.modules:
+            self._hooks.append(module.register_forward_hook(fwd_hook))
+
+    def close(self) -> None:
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []
+
+    @staticmethod
+    def _safe_cholesky(matrix: torch.Tensor, max_tries: int = 6) -> torch.Tensor:
+        ident = torch.eye(matrix.shape[-1], device=matrix.device, dtype=matrix.dtype)
+        jitter = 0.0
+        for k in range(max_tries):
+            chol, info = torch.linalg.cholesky_ex(matrix + jitter * ident, check_errors=False)
+            if int(info.item()) == 0:
+                return chol
+            jitter = (10.0 ** k) * 1e-6
+        return torch.linalg.cholesky(matrix + jitter * ident)
+
+    def _balanced_factor_damping(self, module: nn.Module) -> tuple[float, float]:
+        if self.cfg.damping <= 0.0:
+            return 0.0, 0.0
+        a = self.stats[module]['A']
+        g = self.stats[module]['G']
+        mean_a = max(torch.trace(a).item() / a.shape[0], 1e-12)
+        mean_g = max(torch.trace(g).item() / g.shape[0], 1e-12)
+        pi = math.sqrt(mean_a / mean_g)
+        root = math.sqrt(self.cfg.damping)
+        return pi * root, root / pi
+
+    @staticmethod
+    def _sym(matrix: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (matrix + matrix.transpose(-2, -1))
+
+    def _apply_gradient_momentum(self, module: nn.Module, grad_2d: torch.Tensor) -> torch.Tensor:
+        momentum = float(self.cfg.momentum)
+        if momentum <= 0.0:
+            return grad_2d
+        state = self.state[module]
+        buf = state.get('momentum_buffer', None)
+        if (
+                buf is None
+                or buf.shape != grad_2d.shape
+                or buf.device != grad_2d.device
+                or buf.dtype != grad_2d.dtype
+        ):
+            buf = torch.zeros_like(grad_2d)
+            state['momentum_buffer'] = buf
+        buf.mul_(momentum).add_(grad_2d)
+        return grad_2d.add(buf, alpha=momentum) if self.cfg.nesterov else buf
+
+    def _linear_reduce_factors(self, activations: torch.Tensor, grads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        activations = activations.float().reshape(activations.shape[0], -1, activations.shape[-1])
+        grads = grads.float().reshape(grads.shape[0], -1, grads.shape[-1])
+        batch_size = float(activations.shape[0])
+        a_bar = activations.mean(dim=1)
+        g_sum = grads.sum(dim=1)
+        a_batch = (a_bar.transpose(0, 1) @ a_bar) / batch_size
+        g_batch = (g_sum.transpose(0, 1) @ g_sum) * batch_size
+        return self._sym(a_batch), self._sym(g_batch)
+
+    def _conv2d_reduce_factors(
+            self,
+            module: nn.Conv2d,
+            activations: torch.Tensor,
+            grads: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        patches = F.unfold(
+            activations.float(),
+            kernel_size=module.kernel_size,
+            dilation=module.dilation,
+            padding=module.padding,
+            stride=module.stride,
+        )
+        batch_size = float(patches.shape[0])
+        a_bar = patches.transpose(1, 2).mean(dim=1)
+        grads = grads.float().reshape(patches.shape[0], module.out_channels, -1).transpose(1, 2)
+        g_sum = grads.sum(dim=1)
+        a_batch = (a_bar.transpose(0, 1) @ a_bar) / batch_size
+        g_batch = (g_sum.transpose(0, 1) @ g_sum) * batch_size
+        return self._sym(a_batch), self._sym(g_batch)
+
+    @torch.no_grad()
+    def maybe_update_stats(self) -> None:
+        self._step += 1
+        update_stats = self.cfg.stats_update_every > 0 and (self._step % self.cfg.stats_update_every == 0)
+        update_factors = self.cfg.factor_update_every > 0 and (self._step % self.cfg.factor_update_every == 0)
+
+        if update_stats:
+            gamma = self.cfg.ema_decay
+            one_minus = 1.0 - gamma
+            for module in self.modules:
+                activations = self._cache[module].get('a', None)
+                grads = self._cache[module].get('g', None)
+                if activations is None or grads is None or module.weight.grad is None:
+                    continue
+                if isinstance(module, nn.Linear):
+                    a_batch, g_batch = self._linear_reduce_factors(activations, grads)
+                elif isinstance(module, nn.Conv2d):
+                    a_batch, g_batch = self._conv2d_reduce_factors(module, activations, grads)
+                else:
+                    raise TypeError(f'Unsupported module type: {type(module)}')
+                self.stats[module]['A'].mul_(gamma).add_(a_batch, alpha=one_minus)
+                self.stats[module]['G'].mul_(gamma).add_(g_batch, alpha=one_minus)
+
+        if update_factors:
+            for module in self.modules:
+                a_damp, g_damp = self._balanced_factor_damping(module)
+                a = self.stats[module]['A'] + a_damp * self.eye_a[module]
+                g = self.stats[module]['G'] + g_damp * self.eye_g[module]
+                self.factors[module]['LA'].copy_(self._safe_cholesky(a))
+                self.factors[module]['LG'].copy_(self._safe_cholesky(g))
+
+        for module in self.modules:
+            self._cache[module]['g'] = None
+
+    @torch.no_grad()
+    def compute_steps(self, lr: float) -> list[tuple[nn.Parameter, torch.Tensor, float, float]]:
+        groups = defaultdict(list)
+        for module in self.modules:
+            if module.weight.grad is None:
+                continue
+            grad_2d = module.weight.grad.reshape(module.weight.shape[0], -1).float()
+            update_2d = self._apply_gradient_momentum(module, grad_2d)
+            key = (update_2d.shape[0], update_2d.shape[1], update_2d.device, update_2d.dtype)
+            groups[key].append((module, update_2d))
+
+        steps_for_params = []
+        for modules in groups.values():
+            p_batch = []
+            la_batch = []
+            lg_batch = []
+            meta_modules = []
+            for module, update_2d in modules:
+                p_batch.append(update_2d)
+                la_batch.append(self.factors[module]['LA'])
+                lg_batch.append(self.factors[module]['LG'])
+                meta_modules.append(module)
+
+            p_batch = torch.stack(p_batch, dim=0).contiguous()
+            la_batch = torch.stack(la_batch, dim=0).contiguous()
+            lg_batch = torch.stack(lg_batch, dim=0).contiguous()
+
+            tmp = torch.linalg.solve_triangular(lg_batch, p_batch, upper=False)
+            p_hat = torch.linalg.solve_triangular(la_batch, tmp.transpose(-2, -1), upper=False).transpose(-2, -1)
+
+            q_hat = _muon_quintic_ns(
+                p_hat,
+                ns_steps=self.cfg.muon_ns_steps,
+                ns_coefficients=self.cfg.muon_ns_coefficients,
+                eps=self.cfg.muon_ns_eps,
+            )
+            x_hat = -float(self.cfg.muon_eps) * q_hat
+
+            tmp2 = torch.linalg.solve_triangular(lg_batch.transpose(-2, -1), x_hat, upper=True)
+            x_batch = torch.linalg.solve_triangular(
+                la_batch.transpose(-2, -1),
+                tmp2.transpose(-2, -1),
+                upper=True,
+            ).transpose(-2, -1)
+
+            for idx, module in enumerate(meta_modules):
+                step = x_batch[idx].reshape_as(module.weight)
+                step_lr = _adjust_muon_lr(
+                    lr,
+                    tuple(p_batch[idx].shape),
+                    mode=self.cfg.lr_adjustment,
+                )
+                steps_for_params.append((module.weight, step, lr, step_lr))
+
+        if self.cfg.max_step_norm is not None and steps_for_params:
+            sq_norm = torch.zeros((), device=steps_for_params[0][0].device, dtype=torch.float32)
+            for _, step, _, _ in steps_for_params:
+                sq_norm += step.float().square().sum()
+            norm = sq_norm.sqrt()
+            scale = min(1.0, float(self.cfg.max_step_norm) / float(norm + 1e-12))
+            steps_for_params = [
+                (param, step * scale, wd_lr, step_lr)
+                for param, step, wd_lr, step_lr in steps_for_params
+            ]
+
+        return steps_for_params
+
+    @torch.no_grad()
+    def apply_steps(self, steps_for_params: list[tuple[nn.Parameter, torch.Tensor, float, float]]) -> None:
+        for param, step, weight_decay_lr, step_lr in steps_for_params:
+            if self.cfg.weight_decay != 0.0:
+                param.mul_(1.0 - weight_decay_lr * self.cfg.weight_decay)
+            param.add_(step.to(dtype=param.dtype), alpha=step_lr)
+
+
+class KFACMuonOptimizer(torch.optim.Optimizer):
+    def __init__(
+            self,
+            model: nn.Module,
+            lr: float,
+            weight_decay: float = 0.0,
+            betas: tuple[float, float] = (0.9, 0.95),
+            eps: float = 1e-8,
+            aux_no_decay: bool = True,
+            exclude_first_last: bool = True,
+            kfac_cfg: Optional[_KFACConfig] = None,
+    ):
+        if kfac_cfg is None:
+            kfac_cfg = _KFACConfig()
+        muon_modules, muon_params, aux_params = _split_muon_and_aux_params(
+            model,
+            exclude_first_last=exclude_first_last,
+        )
+        if not muon_modules:
+            raise ValueError(
+                'kfac_muon could not find eligible affine modules. '
+                'Model must contain trainable Linear/Conv2d (groups=1) layers.'
+            )
+
+        param_groups = [
+            {
+                'params': muon_params,
+                'lr': lr,
+                'weight_decay': weight_decay,
+                'group_type': 'muon',
+            }
+        ]
+        if aux_no_decay:
+            aux_groups = _build_aux_adamw_param_groups(
+                model,
+                muon_params=muon_params,
+                weight_decay=weight_decay,
+            )
+            if not aux_groups and aux_params:
+                aux_groups = [{'params': aux_params, 'weight_decay': weight_decay}]
+            for group in aux_groups:
+                group.setdefault('lr', lr)
+                group.setdefault('betas', betas)
+                group.setdefault('eps', eps)
+                group['group_type'] = 'aux'
+            param_groups.extend(aux_groups)
+        elif aux_params:
+            param_groups.append(
+                {
+                    'params': aux_params,
+                    'lr': lr,
+                    'weight_decay': weight_decay,
+                    'betas': betas,
+                    'eps': eps,
+                    'group_type': 'aux',
+                }
+            )
+
+        defaults = dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
+        super().__init__(param_groups, defaults)
+        self._kfac = _KFACReduce(muon_modules, kfac_cfg)
+
+    def close(self) -> None:
+        self._kfac.close()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        muon_lr = self.param_groups[0].get('lr', self.defaults['lr'])
+        self._kfac.maybe_update_stats()
+        kfac_steps = self._kfac.compute_steps(muon_lr)
+
+        for group in self.param_groups:
+            if group.get('group_type') != 'aux':
+                continue
+            lr = group.get('lr', self.defaults['lr'])
+            weight_decay = group.get('weight_decay', self.defaults['weight_decay'])
+            beta1, beta2 = group.get('betas', self.defaults['betas'])
+            eps = group.get('eps', self.defaults['eps'])
+
+            for param in group['params']:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError('kfac_muon aux AdamW path does not support sparse gradients.')
+
+                state = self.state[param]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                state['step'] += 1
+                step = state['step']
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                if weight_decay != 0.0:
+                    param.mul_(1.0 - lr * weight_decay)
+
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+                step_size = lr / bias_correction1
+                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+                param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        self._kfac.apply_steps(kfac_steps)
+        return loss
+
+
+def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
+    if args.opt_betas is None:
+        betas = (0.9, 0.95)
+    else:
+        betas = tuple(args.opt_betas)
+    if len(betas) != 2:
+        raise ValueError(f'--opt-betas must contain exactly two values for kfac_muon, got {betas}')
+
+    if not 0.0 <= args.kfac_momentum < 1.0:
+        raise ValueError(f'--kfac-momentum must be in [0, 1), got {args.kfac_momentum}')
+    if args.kfac_stats_update_every <= 0:
+        raise ValueError(
+            f'--kfac-stats-update-every must be > 0 for kfac_muon, got {args.kfac_stats_update_every}'
+        )
+    if args.kfac_factor_update_every <= 0:
+        raise ValueError(
+            f'--kfac-factor-update-every must be > 0 for kfac_muon, got {args.kfac_factor_update_every}'
+        )
+
+    eps = 1e-8 if args.opt_eps is None else args.opt_eps
+    kfac_cfg = _KFACConfig(
+        damping=args.kfac_damping,
+        ema_decay=args.kfac_ema_decay,
+        stats_update_every=args.kfac_stats_update_every,
+        factor_update_every=args.kfac_factor_update_every,
+        momentum=args.kfac_momentum,
+        nesterov=args.kfac_nesterov,
+        muon_eps=args.kfac_muon_eps,
+        muon_ns_steps=args.kfac_muon_ns_steps,
+        muon_ns_eps=args.kfac_muon_ns_eps,
+        lr_adjustment=args.kfac_muon_lr_adjustment,
+        weight_decay=args.weight_decay,
+        max_step_norm=args.kfac_max_step_norm,
+    )
+    return KFACMuonOptimizer(
+        model=model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=betas,
+        eps=eps,
+        aux_no_decay=args.kfac_aux_no_decay,
+        exclude_first_last=args.kfac_exclude_first_last,
+        kfac_cfg=kfac_cfg,
+    )
+
+
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -473,6 +1088,10 @@ def main():
     else:
         _logger.info(f'Training with a single process on 1 device ({args.device}).')
     assert args.rank >= 0
+
+    if args.data and not args.data_dir:
+        args.data_dir = args.data
+    _maybe_apply_image_folder_defaults(args)
 
     model_dtype = None
     if args.model_dtype:
@@ -599,11 +1218,15 @@ def main():
                 f'Learning rate ({args.lr}) calculated from base learning rate ({args.lr_base}) '
                 f'and effective global batch size ({global_batch_size}) with {args.lr_base_scale} scaling.')
 
-    optimizer = create_optimizer_v2(
-        model,
-        **optimizer_kwargs(cfg=args),
-        **args.opt_kwargs,
-    )
+    if args.opt.lower() == 'kfac_muon':
+        optimizer = _create_kfac_muon_optimizer(model, args)
+    else:
+        optimizer = create_optimizer_v2(
+            model,
+            **optimizer_kwargs(cfg=args),
+            **args.opt_kwargs,
+        )
+    kfac_muon_enabled = isinstance(optimizer, KFACMuonOptimizer)
     if utils.is_primary(args):
         defaults = copy.deepcopy(optimizer.defaults)
         defaults['weight_decay'] = args.weight_decay  # this isn't stored in optimizer.defaults
@@ -1139,6 +1762,9 @@ def main():
 
     except KeyboardInterrupt:
         pass
+
+    if kfac_muon_enabled:
+        optimizer.close()
 
     if args.distributed:
         torch.distributed.destroy_process_group()
