@@ -1014,6 +1014,15 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
         if kfac_state is not None:
             self._load_kfac_state_dict(kfac_state)
+            _logger.info(
+                "Loaded kfac_reduce_state from checkpoint (kfac_step=%s).",
+                kfac_state.get('kfac_step', 'unknown') if isinstance(kfac_state, dict) else 'unknown',
+            )
+        else:
+            _logger.warning(
+                "Checkpoint is missing kfac_reduce_state; KFAC internal statistics/factors will reset on resume. "
+                "Use checkpoints saved after the KFAC resume-state patch for stable continuation."
+            )
 
     @torch.no_grad()
     def step(self, closure=None):
