@@ -950,6 +950,71 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
     def close(self) -> None:
         self._kfac.close()
 
+    def _kfac_state_dict(self) -> dict:
+        modules_state = []
+        for module in self._kfac.modules:
+            module_state = {
+                'A': self._kfac.stats[module]['A'].detach().clone(),
+                'G': self._kfac.stats[module]['G'].detach().clone(),
+                'LA': self._kfac.factors[module]['LA'].detach().clone(),
+                'LG': self._kfac.factors[module]['LG'].detach().clone(),
+            }
+            momentum_buffer = self._kfac.state[module].get('momentum_buffer', None)
+            if momentum_buffer is not None:
+                module_state['momentum_buffer'] = momentum_buffer.detach().clone()
+            modules_state.append(module_state)
+        return {
+            'kfac_step': int(self._kfac._step),
+            'modules_state': modules_state,
+        }
+
+    def state_dict(self):
+        state = super().state_dict()
+        state['kfac_reduce_state'] = self._kfac_state_dict()
+        return state
+
+    def _load_kfac_state_dict(self, kfac_state: dict) -> None:
+        if not isinstance(kfac_state, dict):
+            return
+        modules_state = kfac_state.get('modules_state', None)
+        if not isinstance(modules_state, list) or len(modules_state) != len(self._kfac.modules):
+            return
+
+        self._kfac._step = int(kfac_state.get('kfac_step', 0))
+        for module, saved in zip(self._kfac.modules, modules_state):
+            if not isinstance(saved, dict):
+                continue
+
+            for key, dest in (
+                    ('A', self._kfac.stats[module]['A']),
+                    ('G', self._kfac.stats[module]['G']),
+                    ('LA', self._kfac.factors[module]['LA']),
+                    ('LG', self._kfac.factors[module]['LG']),
+            ):
+                src = saved.get(key, None)
+                if src is None or not torch.is_tensor(src) or src.shape != dest.shape:
+                    continue
+                dest.copy_(src.to(device=dest.device, dtype=dest.dtype))
+
+            momentum_buffer = saved.get('momentum_buffer', None)
+            if (
+                    momentum_buffer is not None
+                    and torch.is_tensor(momentum_buffer)
+                    and module.weight is not None
+            ):
+                expected_shape = (module.weight.shape[0], module.weight[0].numel())
+                if tuple(momentum_buffer.shape) == expected_shape:
+                    self._kfac.state[module]['momentum_buffer'] = momentum_buffer.to(
+                        device=module.weight.device,
+                        dtype=torch.float32,
+                    )
+
+    def load_state_dict(self, state_dict):
+        kfac_state = state_dict.pop('kfac_reduce_state', None)
+        super().load_state_dict(state_dict)
+        if kfac_state is not None:
+            self._load_kfac_state_dict(kfac_state)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
