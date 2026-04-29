@@ -2184,18 +2184,20 @@ def main():
 
             if output_dir is not None:
                 lrs = [param_group['lr'] for param_group in optimizer.param_groups]
-                summary_extra = {}
+                summary_train_metrics = train_metrics
                 if isinstance(optimizer, KFACMuonOptimizer):
-                    summary_extra['kfac_damping'] = optimizer.get_kfac_damping()
+                    # Keep compatibility with timm versions whose update_summary
+                    # does not accept arbitrary kwargs: log damping via train metrics.
+                    summary_train_metrics = OrderedDict(train_metrics)
+                    summary_train_metrics['kfac_damping'] = optimizer.get_kfac_damping()
                 utils.update_summary(
                     epoch,
-                    train_metrics,
+                    summary_train_metrics,
                     eval_metrics,
                     filename=os.path.join(output_dir, 'summary.csv'),
                     lr=sum(lrs) / len(lrs),
                     write_header=best_metric is None,
                     log_wandb=args.log_wandb and has_wandb,
-                    **summary_extra,
                 )
 
             if eval_metrics is not None:
