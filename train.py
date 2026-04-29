@@ -190,7 +190,7 @@ group.add_argument('--device-modules', default=None, type=str, nargs='+',
 # Optimizer parameters
 group = parser.add_argument_group('Optimizer parameters')
 group.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
-                   help='Optimizer (default: "sgd"). Includes "kfac_muon" for reduce-style KFAC-Muon.')
+                   help='Optimizer (default: "sgd"). Includes "kfac_muon" and "fismo".')
 group.add_argument('--opt-eps', default=None, type=float, metavar='EPSILON',
                    help='Optimizer Epsilon (default: None, use opt default)')
 group.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
@@ -212,6 +212,15 @@ group.add_argument('--layer-decay-no-opt-scale', type=float, default=None,
 group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwargs)
 group.add_argument('--kfac-damping', type=float, default=1e-3,
                    help='KFAC damping for --opt kfac_muon (default: 1e-3)')
+group.add_argument('--kfac-damping-schedule', type=str, default='none',
+                   choices=['none', 'linear', 'cosine'],
+                   help='Optional epoch-wise schedule for KFAC damping in --opt kfac_muon (default: none)')
+group.add_argument('--kfac-damping-final', type=float, default=None,
+                   help='Final KFAC damping for --opt kfac_muon schedule (default: same as --kfac-damping)')
+group.add_argument('--kfac-damping-start-epoch', type=int, default=0,
+                   help='Start epoch (inclusive) for KFAC damping schedule in --opt kfac_muon (default: 0)')
+group.add_argument('--kfac-damping-end-epoch', type=int, default=None,
+                   help='End epoch (inclusive) for KFAC damping schedule in --opt kfac_muon (default: last epoch)')
 group.add_argument('--kfac-ema-decay', type=float, default=0.95,
                    help='EMA decay for KFAC statistics for --opt kfac_muon (default: 0.95)')
 group.add_argument('--kfac-stats-update-every', type=int, default=20,
@@ -243,10 +252,32 @@ group.add_argument('--kfac-aux-no-decay', dest='kfac_aux_no_decay', action='stor
                    help='Use no-weight-decay rules for auxiliary AdamW params in --opt kfac_muon (default: enabled)')
 group.add_argument('--no-kfac-aux-no-decay', dest='kfac_aux_no_decay', action='store_false',
                    help='Apply weight decay to all auxiliary AdamW params in --opt kfac_muon')
+group.add_argument('--fismo-damping', type=float, default=1e-3,
+                   help='Damping factor mu for --opt fismo (default: 1e-3)')
+group.add_argument('--fismo-ema-decay', type=float, default=0.95,
+                   help='EMA decay gamma for --opt fismo preconditioners (default: 0.95)')
+group.add_argument('--fismo-momentum', type=float, default=0.95,
+                   help='Whitened momentum beta for --opt fismo (default: 0.95)')
+group.add_argument('--fismo-matrix-eps', type=float, default=1e-8,
+                   help='Numerical epsilon for SPD eigendecompositions in --opt fismo (default: 1e-8)')
+group.add_argument('--fismo-ns-steps', type=int, default=5,
+                   help='Newton-Schulz iterations for Polar(.) approximation in --opt fismo (default: 5)')
+group.add_argument('--fismo-ns-eps', type=float, default=1e-7,
+                   help='Numerical epsilon for Newton-Schulz in --opt fismo (default: 1e-7)')
+group.add_argument('--fismo-exclude-first-last', dest='fismo_exclude_first_last', action='store_true',
+                   help='Exclude first and last affine layers from FISMO set (default: enabled)')
+group.add_argument('--no-fismo-exclude-first-last', dest='fismo_exclude_first_last', action='store_false',
+                   help='Include first and last affine layers in FISMO set')
+group.add_argument('--fismo-aux-no-decay', dest='fismo_aux_no_decay', action='store_true',
+                   help='Use no-weight-decay rules for auxiliary AdamW params in --opt fismo (default: enabled)')
+group.add_argument('--no-fismo-aux-no-decay', dest='fismo_aux_no_decay', action='store_false',
+                   help='Apply weight decay to all auxiliary AdamW params in --opt fismo')
 parser.set_defaults(
     kfac_nesterov=True,
     kfac_exclude_first_last=True,
     kfac_aux_no_decay=True,
+    fismo_exclude_first_last=True,
+    fismo_aux_no_decay=True,
 )
 
 # Learning rate schedule parameters
@@ -950,6 +981,15 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
     def close(self) -> None:
         self._kfac.close()
 
+    def set_kfac_damping(self, damping: float) -> None:
+        damping = float(damping)
+        if damping < 0.0:
+            raise ValueError(f'KFAC damping must be >= 0, got {damping}')
+        self._kfac.cfg.damping = damping
+
+    def get_kfac_damping(self) -> float:
+        return float(self._kfac.cfg.damping)
+
     def _kfac_state_dict(self) -> dict:
         modules_state = []
         for module in self._kfac.modules:
@@ -1095,6 +1135,18 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         raise ValueError(
             f'--kfac-factor-update-every must be > 0 for kfac_muon, got {args.kfac_factor_update_every}'
         )
+    if args.kfac_damping < 0.0:
+        raise ValueError(f'--kfac-damping must be >= 0 for kfac_muon, got {args.kfac_damping}')
+    if args.kfac_damping_final is not None and args.kfac_damping_final < 0.0:
+        raise ValueError(f'--kfac-damping-final must be >= 0 for kfac_muon, got {args.kfac_damping_final}')
+    if args.kfac_damping_start_epoch < 0:
+        raise ValueError(
+            f'--kfac-damping-start-epoch must be >= 0 for kfac_muon, got {args.kfac_damping_start_epoch}'
+        )
+    if args.kfac_damping_end_epoch is not None and args.kfac_damping_end_epoch < 0:
+        raise ValueError(
+            f'--kfac-damping-end-epoch must be >= 0 for kfac_muon, got {args.kfac_damping_end_epoch}'
+        )
 
     eps = 1e-8 if args.opt_eps is None else args.opt_eps
     kfac_cfg = _KFACConfig(
@@ -1120,6 +1172,312 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         aux_no_decay=args.kfac_aux_no_decay,
         exclude_first_last=args.kfac_exclude_first_last,
         kfac_cfg=kfac_cfg,
+    )
+
+
+def _sym_2d(matrix: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (matrix + matrix.transpose(-2, -1))
+
+
+def _kfac_damping_for_epoch(args, epoch: int, num_epochs: int) -> float:
+    base = float(args.kfac_damping)
+    mode = args.kfac_damping_schedule
+    if mode == 'none' or num_epochs <= 1:
+        return base
+
+    final = base if args.kfac_damping_final is None else float(args.kfac_damping_final)
+    start = int(max(0, args.kfac_damping_start_epoch))
+    end = int(num_epochs - 1 if args.kfac_damping_end_epoch is None else args.kfac_damping_end_epoch)
+
+    # Keep bounds sane even for unusual schedule configs.
+    start = min(start, num_epochs - 1)
+    end = min(max(end, start), num_epochs - 1)
+
+    if epoch <= start:
+        return base
+    if epoch >= end:
+        return final
+
+    progress = (epoch - start) / float(end - start)
+    if mode == 'linear':
+        alpha = progress
+    elif mode == 'cosine':
+        alpha = 0.5 * (1.0 - math.cos(math.pi * progress))
+    else:
+        raise ValueError(f'Unknown KFAC damping schedule mode: {mode}')
+
+    return base + (final - base) * alpha
+
+
+def _normalize_trace(matrix: torch.Tensor, target_trace: float, eps: float) -> torch.Tensor:
+    matrix = _sym_2d(matrix)
+    tr = torch.trace(matrix).clamp_min(eps)
+    return _sym_2d(matrix * (target_trace / tr))
+
+
+def _spd_inverse_and_inv_sqrt(matrix: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    matrix = _sym_2d(matrix.float())
+    eigvals, eigvecs = torch.linalg.eigh(matrix)
+    eigvals = eigvals.clamp_min(eps)
+    inv = (eigvecs * eigvals.reciprocal().unsqueeze(0)) @ eigvecs.transpose(-2, -1)
+    inv_sqrt = (eigvecs * eigvals.rsqrt().unsqueeze(0)) @ eigvecs.transpose(-2, -1)
+    return _sym_2d(inv), _sym_2d(inv_sqrt)
+
+
+@dataclass
+class _FISMOConfig:
+    damping: float = 1e-3
+    ema_decay: float = 0.95
+    momentum: float = 0.95
+    matrix_eps: float = 1e-8
+    ns_steps: int = 5
+    ns_eps: float = 1e-7
+    ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315)
+
+
+class FISMOOptimizer(torch.optim.Optimizer):
+    """FISMO optimizer following Algorithm 1 from arXiv:2601.21750."""
+    def __init__(
+            self,
+            model: nn.Module,
+            lr: float,
+            weight_decay: float = 0.0,
+            betas: tuple[float, float] = (0.9, 0.95),
+            eps: float = 1e-8,
+            aux_no_decay: bool = True,
+            exclude_first_last: bool = True,
+            fismo_cfg: Optional[_FISMOConfig] = None,
+    ):
+        if fismo_cfg is None:
+            fismo_cfg = _FISMOConfig()
+        _, fismo_params, aux_params = _split_muon_and_aux_params(
+            model,
+            exclude_first_last=exclude_first_last,
+        )
+        if not fismo_params:
+            raise ValueError(
+                'fismo could not find eligible affine modules. '
+                'Model must contain trainable Linear/Conv2d (groups=1) layers.'
+            )
+
+        param_groups = [
+            {
+                'params': fismo_params,
+                'lr': lr,
+                'weight_decay': weight_decay,
+                'group_type': 'fismo',
+            }
+        ]
+        if aux_no_decay:
+            aux_groups = _build_aux_adamw_param_groups(
+                model,
+                muon_params=fismo_params,
+                weight_decay=weight_decay,
+            )
+            if not aux_groups and aux_params:
+                aux_groups = [{'params': aux_params, 'weight_decay': weight_decay}]
+            for group in aux_groups:
+                group.setdefault('lr', lr)
+                group.setdefault('betas', betas)
+                group.setdefault('eps', eps)
+                group['group_type'] = 'aux'
+            param_groups.extend(aux_groups)
+        elif aux_params:
+            param_groups.append(
+                {
+                    'params': aux_params,
+                    'lr': lr,
+                    'weight_decay': weight_decay,
+                    'betas': betas,
+                    'eps': eps,
+                    'group_type': 'aux',
+                }
+            )
+
+        defaults = dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
+        super().__init__(param_groups, defaults)
+        self.cfg = fismo_cfg
+
+    def close(self) -> None:
+        return
+
+    def _init_fismo_state(self, param: nn.Parameter, grad_2d: torch.Tensor) -> dict:
+        m, n = grad_2d.shape
+        device = grad_2d.device
+        dtype = torch.float32
+        state = self.state[param]
+        state.clear()
+        state['P'] = torch.eye(m, device=device, dtype=dtype)
+        state['Q'] = torch.eye(n, device=device, dtype=dtype)
+        state['M'] = torch.zeros((m, n), device=device, dtype=dtype)
+        state['I_m'] = torch.eye(m, device=device, dtype=dtype)
+        state['I_n'] = torch.eye(n, device=device, dtype=dtype)
+        return state
+
+    def _get_fismo_state(self, param: nn.Parameter, grad_2d: torch.Tensor) -> dict:
+        state = self.state[param]
+        expected_shapes = (
+            tuple(grad_2d.shape),
+            (grad_2d.shape[0], grad_2d.shape[0]),
+            (grad_2d.shape[1], grad_2d.shape[1]),
+        )
+        if (
+                'M' not in state
+                or 'P' not in state
+                or 'Q' not in state
+                or tuple(state['M'].shape) != expected_shapes[0]
+                or tuple(state['P'].shape) != expected_shapes[1]
+                or tuple(state['Q'].shape) != expected_shapes[2]
+        ):
+            state = self._init_fismo_state(param, grad_2d)
+        return state
+
+    @torch.no_grad()
+    def _fismo_step_param(self, param: nn.Parameter, lr: float, weight_decay: float) -> None:
+        grad = param.grad
+        if grad is None:
+            return
+        if grad.is_sparse:
+            raise RuntimeError('fismo path does not support sparse gradients.')
+
+        grad_2d = grad.reshape(grad.shape[0], -1).float()
+        m, n = grad_2d.shape
+        state = self._get_fismo_state(param, grad_2d)
+        p_prev = state['P']
+        q_prev = state['Q']
+        mom_prev = state['M']
+        i_m = state['I_m']
+        i_n = state['I_n']
+
+        # Step 4: update left preconditioner P_t using Q_{t-1}.
+        q_inv, _ = _spd_inverse_and_inv_sqrt(q_prev, self.cfg.matrix_eps)
+        l_t = (grad_2d @ q_inv @ grad_2d.transpose(-2, -1)) / float(n)
+        l_t = _sym_2d(l_t + self.cfg.damping * (torch.trace(p_prev) / float(m)) * i_m)
+        p_tilde = self.cfg.ema_decay * p_prev + (1.0 - self.cfg.ema_decay) * l_t
+        p_t = _normalize_trace(p_tilde, target_trace=float(m), eps=self.cfg.matrix_eps)
+
+        # Step 5: update right preconditioner Q_t using updated P_t.
+        p_inv, p_inv_sqrt = _spd_inverse_and_inv_sqrt(p_t, self.cfg.matrix_eps)
+        r_t = (grad_2d.transpose(-2, -1) @ p_inv @ grad_2d) / float(m)
+        r_t = _sym_2d(r_t + self.cfg.damping * (torch.trace(q_prev) / float(n)) * i_n)
+        q_tilde = self.cfg.ema_decay * q_prev + (1.0 - self.cfg.ema_decay) * r_t
+        q_t = _normalize_trace(q_tilde, target_trace=float(n), eps=self.cfg.matrix_eps)
+
+        # Steps 6-8: whitened momentum and orthogonalized update.
+        _, q_inv_sqrt = _spd_inverse_and_inv_sqrt(q_t, self.cfg.matrix_eps)
+        g_hat = p_inv_sqrt @ grad_2d @ q_inv_sqrt
+        m_t = self.cfg.momentum * mom_prev + (1.0 - self.cfg.momentum) * g_hat
+        polar_m_t = _muon_quintic_ns(
+            m_t,
+            ns_steps=self.cfg.ns_steps,
+            ns_coefficients=self.cfg.ns_coefficients,
+            eps=self.cfg.ns_eps,
+        )
+        delta_w = p_inv_sqrt @ polar_m_t @ q_inv_sqrt
+
+        state['P'].copy_(p_t)
+        state['Q'].copy_(q_t)
+        state['M'].copy_(m_t)
+
+        # Step 9: apply decoupled weight decay and parameter update.
+        if weight_decay != 0.0:
+            param.mul_(1.0 - lr * weight_decay)
+        param.add_(delta_w.reshape_as(param).to(dtype=param.dtype), alpha=-lr)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            group_type = group.get('group_type')
+            if group_type == 'fismo':
+                lr = group.get('lr', self.defaults['lr'])
+                weight_decay = group.get('weight_decay', self.defaults['weight_decay'])
+                for param in group['params']:
+                    self._fismo_step_param(param, lr=lr, weight_decay=weight_decay)
+                continue
+
+            if group_type != 'aux':
+                continue
+            lr = group.get('lr', self.defaults['lr'])
+            weight_decay = group.get('weight_decay', self.defaults['weight_decay'])
+            beta1, beta2 = group.get('betas', self.defaults['betas'])
+            eps = group.get('eps', self.defaults['eps'])
+
+            for param in group['params']:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError('fismo aux AdamW path does not support sparse gradients.')
+
+                state = self.state[param]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                state['step'] += 1
+                step = state['step']
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                if weight_decay != 0.0:
+                    param.mul_(1.0 - lr * weight_decay)
+
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+                step_size = lr / bias_correction1
+                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+                param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+
+def _create_fismo_optimizer(model: nn.Module, args) -> FISMOOptimizer:
+    if args.opt_betas is None:
+        betas = (0.9, 0.95)
+    else:
+        betas = tuple(args.opt_betas)
+    if len(betas) != 2:
+        raise ValueError(f'--opt-betas must contain exactly two values for fismo, got {betas}')
+    if not 0.0 <= args.fismo_momentum < 1.0:
+        raise ValueError(f'--fismo-momentum must be in [0, 1), got {args.fismo_momentum}')
+    if not 0.0 <= args.fismo_ema_decay < 1.0:
+        raise ValueError(f'--fismo-ema-decay must be in [0, 1), got {args.fismo_ema_decay}')
+    if args.fismo_damping < 0.0:
+        raise ValueError(f'--fismo-damping must be >= 0, got {args.fismo_damping}')
+    if args.fismo_matrix_eps <= 0.0:
+        raise ValueError(f'--fismo-matrix-eps must be > 0, got {args.fismo_matrix_eps}')
+    if args.fismo_ns_steps <= 0:
+        raise ValueError(f'--fismo-ns-steps must be > 0, got {args.fismo_ns_steps}')
+    if args.fismo_ns_eps <= 0.0:
+        raise ValueError(f'--fismo-ns-eps must be > 0, got {args.fismo_ns_eps}')
+
+    eps = 1e-8 if args.opt_eps is None else args.opt_eps
+    fismo_cfg = _FISMOConfig(
+        damping=args.fismo_damping,
+        ema_decay=args.fismo_ema_decay,
+        momentum=args.fismo_momentum,
+        matrix_eps=args.fismo_matrix_eps,
+        ns_steps=args.fismo_ns_steps,
+        ns_eps=args.fismo_ns_eps,
+    )
+    return FISMOOptimizer(
+        model=model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=betas,
+        eps=eps,
+        aux_no_decay=args.fismo_aux_no_decay,
+        exclude_first_last=args.fismo_exclude_first_last,
+        fismo_cfg=fismo_cfg,
     )
 
 
@@ -1294,13 +1652,15 @@ def main():
 
     if args.opt.lower() == 'kfac_muon':
         optimizer = _create_kfac_muon_optimizer(model, args)
+    elif args.opt.lower() == 'fismo':
+        optimizer = _create_fismo_optimizer(model, args)
     else:
         optimizer = create_optimizer_v2(
             model,
             **optimizer_kwargs(cfg=args),
             **args.opt_kwargs,
         )
-    kfac_muon_enabled = isinstance(optimizer, KFACMuonOptimizer)
+    custom_optimizer_enabled = isinstance(optimizer, (KFACMuonOptimizer, FISMOOptimizer))
     if utils.is_primary(args):
         defaults = copy.deepcopy(optimizer.defaults)
         defaults['weight_decay'] = args.weight_decay  # this isn't stored in optimizer.defaults
@@ -1727,10 +2087,31 @@ def main():
         _logger.info(
             f'Scheduled epochs: {num_epochs} {sched_explain}. '
             f'LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
+        if isinstance(optimizer, KFACMuonOptimizer):
+            end_epoch = num_epochs - 1 if args.kfac_damping_end_epoch is None else args.kfac_damping_end_epoch
+            final_damping = args.kfac_damping if args.kfac_damping_final is None else args.kfac_damping_final
+            _logger.info(
+                'KFAC damping schedule: mode=%s base=%g final=%g start_epoch=%d end_epoch=%s',
+                args.kfac_damping_schedule,
+                args.kfac_damping,
+                final_damping,
+                args.kfac_damping_start_epoch,
+                end_epoch,
+            )
 
     results = []
     try:
         for epoch in range(start_epoch, num_epochs):
+            if isinstance(optimizer, KFACMuonOptimizer):
+                damping_now = _kfac_damping_for_epoch(args, epoch, num_epochs)
+                optimizer.set_kfac_damping(damping_now)
+                if utils.is_primary(args):
+                    _logger.info(
+                        'KFAC damping @ epoch %d: %.6g',
+                        epoch,
+                        optimizer.get_kfac_damping(),
+                    )
+
             if hasattr(dataset_train, 'set_epoch'):
                 dataset_train.set_epoch(epoch)
             elif args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
@@ -1803,6 +2184,9 @@ def main():
 
             if output_dir is not None:
                 lrs = [param_group['lr'] for param_group in optimizer.param_groups]
+                summary_extra = {}
+                if isinstance(optimizer, KFACMuonOptimizer):
+                    summary_extra['kfac_damping'] = optimizer.get_kfac_damping()
                 utils.update_summary(
                     epoch,
                     train_metrics,
@@ -1811,6 +2195,7 @@ def main():
                     lr=sum(lrs) / len(lrs),
                     write_header=best_metric is None,
                     log_wandb=args.log_wandb and has_wandb,
+                    **summary_extra,
                 )
 
             if eval_metrics is not None:
@@ -1837,7 +2222,7 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    if kfac_muon_enabled:
+    if custom_optimizer_enabled and hasattr(optimizer, 'close'):
         optimizer.close()
 
     if args.distributed:
