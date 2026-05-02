@@ -469,6 +469,10 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
+group.add_argument('--profile-runtime', action='store_true', default=False,
+                   help='Enable lightweight runtime profiling for train loop and optimizer internals.')
+group.add_argument('--profile-runtime-sync', action='store_true', default=False,
+                   help='Synchronize device around profiled regions for more accurate timing (slower).')
 group.add_argument('--wandb-project', default=None, type=str,
                    help='wandb project name')
 group.add_argument('--wandb-tags', default=[], type=str, nargs='+',
@@ -1007,6 +1011,9 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
         defaults = dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
         super().__init__(param_groups, defaults)
         self._kfac = _KFACReduce(muon_modules, kfac_cfg)
+        self._profile_enabled = False
+        self._profile_totals = defaultdict(float)
+        self._profile_counts = defaultdict(int)
 
     def close(self) -> None:
         self._kfac.close()
@@ -1019,6 +1026,23 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
 
     def get_kfac_damping(self) -> float:
         return float(self._kfac.cfg.damping)
+
+    def set_profile_enabled(self, enabled: bool) -> None:
+        self._profile_enabled = bool(enabled)
+
+    def reset_profile_stats(self) -> None:
+        self._profile_totals.clear()
+        self._profile_counts.clear()
+
+    def get_profile_stats(self, reset: bool = False) -> dict:
+        out = {}
+        for k, v in self._profile_totals.items():
+            out[k] = float(v)
+        for k, v in self._profile_counts.items():
+            out[f'count_{k}'] = int(v)
+        if reset:
+            self.reset_profile_stats()
+        return out
 
     def _kfac_state_dict(self) -> dict:
         modules_state = []
@@ -1101,10 +1125,20 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        step_start = time.perf_counter() if self._profile_enabled else None
         muon_lr = self.param_groups[0].get('lr', self.defaults['lr'])
-        self._kfac.maybe_update_stats()
-        kfac_steps = self._kfac.compute_steps(muon_lr)
 
+        t0 = time.perf_counter() if self._profile_enabled else None
+        self._kfac.maybe_update_stats()
+        if self._profile_enabled:
+            self._profile_totals['kfac_maybe_update_stats_s'] += time.perf_counter() - t0
+
+        t1 = time.perf_counter() if self._profile_enabled else None
+        kfac_steps = self._kfac.compute_steps(muon_lr)
+        if self._profile_enabled:
+            self._profile_totals['kfac_compute_steps_s'] += time.perf_counter() - t1
+
+        aux_start = time.perf_counter() if self._profile_enabled else None
         for group in self.param_groups:
             if group.get('group_type') != 'aux':
                 continue
@@ -1142,8 +1176,15 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
                 step_size = lr / bias_correction1
                 denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
                 param.addcdiv_(exp_avg, denom, value=-step_size)
+        if self._profile_enabled:
+            self._profile_totals['kfac_aux_adamw_s'] += time.perf_counter() - aux_start
 
+        apply_start = time.perf_counter() if self._profile_enabled else None
         self._kfac.apply_steps(kfac_steps)
+        if self._profile_enabled:
+            self._profile_totals['kfac_apply_steps_s'] += time.perf_counter() - apply_start
+            self._profile_totals['kfac_step_total_s'] += time.perf_counter() - step_start
+            self._profile_counts['kfac_steps'] += 1
         return loss
 
 
@@ -2315,8 +2356,24 @@ def train_one_epoch(
     update_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    profile_enabled = bool(getattr(args, 'profile_runtime', False))
+    profile_sync = profile_enabled and bool(getattr(args, 'profile_runtime_sync', False))
+    profile_stats = defaultdict(float)
+    profile_counts = defaultdict(int)
+
+    def _profile_device_sync() -> None:
+        if not profile_sync:
+            return
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        elif device.type == 'npu':
+            torch.npu.synchronize()
 
     model.train()
+    if profile_enabled and hasattr(optimizer, 'set_profile_enabled'):
+        optimizer.set_profile_enabled(True)
+        if hasattr(optimizer, 'reset_profile_stats'):
+            optimizer.reset_profile_stats()
 
     accum_steps = args.grad_accum_steps
     last_accum_steps = len(loader) % accum_steps
@@ -2326,7 +2383,11 @@ def train_one_epoch(
     last_batch_idx_to_accum = len(loader) - last_accum_steps
 
     data_start_time = update_start_time = time.time()
+    zg_start = time.perf_counter() if profile_enabled else None
     optimizer.zero_grad()
+    if profile_enabled:
+        profile_stats['optimizer_zero_grad_s'] += time.perf_counter() - zg_start
+        profile_counts['optimizer_zero_grad_calls'] += 1
     update_sample_count = 0
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_batch_idx
@@ -2336,9 +2397,17 @@ def train_one_epoch(
             accum_steps = last_accum_steps
 
         if not args.prefetcher:
+            h2d_start = time.perf_counter() if profile_enabled else None
+            _profile_device_sync()
             input, target = input.to(device=device, dtype=model_dtype), target.to(device=device)
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
+            _profile_device_sync()
+            if profile_enabled:
+                profile_stats['host_to_device_and_mixup_s'] += time.perf_counter() - h2d_start
+                profile_counts['batches'] += 1
+        elif profile_enabled:
+            profile_counts['batches'] += 1
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
@@ -2346,6 +2415,8 @@ def train_one_epoch(
         data_time_m.update(accum_steps * (time.time() - data_start_time))
 
         def _forward():
+            fw_start = time.perf_counter() if profile_enabled else None
+            _profile_device_sync()
             with amp_autocast():
                 # Task handles the complete forward pass and loss computation
                 result = task(input, target)
@@ -2353,10 +2424,15 @@ def train_one_epoch(
 
             if accum_steps > 1:
                 _loss /= accum_steps
+            _profile_device_sync()
+            if profile_enabled:
+                profile_stats['forward_s'] += time.perf_counter() - fw_start
             return _loss, result
 
         def _backward(_loss):
             if loss_scaler is not None:
+                bw_start = time.perf_counter() if profile_enabled else None
+                _profile_device_sync()
                 loss_scaler(
                     _loss,
                     optimizer,
@@ -2366,16 +2442,37 @@ def train_one_epoch(
                     create_graph=second_order,
                     need_update=need_update,
                 )
+                _profile_device_sync()
+                if profile_enabled:
+                    profile_stats['backward_plus_step_s'] += time.perf_counter() - bw_start
+                    if need_update:
+                        profile_counts['optimizer_step_calls'] += 1
             else:
+                bw_start = time.perf_counter() if profile_enabled else None
+                _profile_device_sync()
                 _loss.backward(create_graph=second_order)
+                _profile_device_sync()
+                if profile_enabled:
+                    profile_stats['backward_s'] += time.perf_counter() - bw_start
                 if need_update:
                     if args.clip_grad is not None:
+                        clip_start = time.perf_counter() if profile_enabled else None
+                        _profile_device_sync()
                         utils.dispatch_clip_grad(
                             model_parameters(model, exclude_head='agc' in args.clip_mode),
                             value=args.clip_grad,
                             mode=args.clip_mode,
                         )
+                        _profile_device_sync()
+                        if profile_enabled:
+                            profile_stats['clip_grad_s'] += time.perf_counter() - clip_start
+                    step_start = time.perf_counter() if profile_enabled else None
+                    _profile_device_sync()
                     optimizer.step()
+                    _profile_device_sync()
+                    if profile_enabled:
+                        profile_stats['optimizer_step_s'] += time.perf_counter() - step_start
+                        profile_counts['optimizer_step_calls'] += 1
 
         if naflex_mode:
             assert isinstance(input, dict)
@@ -2434,15 +2531,25 @@ def train_one_epoch(
             continue
 
         num_updates += 1
+        if profile_enabled:
+            profile_counts['updates'] += 1
+        zg_start = time.perf_counter() if profile_enabled else None
         optimizer.zero_grad()
+        if profile_enabled:
+            profile_stats['optimizer_zero_grad_s'] += time.perf_counter() - zg_start
+            profile_counts['optimizer_zero_grad_calls'] += 1
         if model_ema is not None:
             model_ema.update(model, step=num_updates)
 
         if args.synchronize_step:
+            sync_start = time.perf_counter() if profile_enabled else None
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             elif device.type == 'npu':
                 torch.npu.synchronize()
+            if profile_enabled:
+                profile_stats['synchronize_step_s'] += time.perf_counter() - sync_start
+                profile_counts['synchronize_step_calls'] += 1
         time_now = time.time()
 
         update_time_m.update(time.time() - update_start_time)
@@ -2491,12 +2598,57 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
+    if profile_enabled:
+        if hasattr(optimizer, 'get_profile_stats'):
+            opt_stats = optimizer.get_profile_stats(reset=False)
+            for k, v in opt_stats.items():
+                if k.startswith('count_'):
+                    profile_counts[k[6:]] += int(v)
+                else:
+                    profile_stats[k] += float(v)
+
+        if utils.is_primary(args):
+            updates = max(1, int(profile_counts.get('updates', 0)))
+            batches = max(1, int(profile_counts.get('batches', 0)))
+            _logger.info(
+                'Runtime profile epoch %d | per-update ms: step=%.3f zero_grad=%.3f kfac_total=%.3f '
+                'kfac_stats=%.3f kfac_solve=%.3f kfac_apply=%.3f aux_adamw=%.3f '
+                '| per-batch ms: h2d+mixup=%.3f fw=%.3f bw=%.3f bw+step(fp16)=%.3f',
+                epoch,
+                1000.0 * profile_stats.get('optimizer_step_s', 0.0) / updates,
+                1000.0 * profile_stats.get('optimizer_zero_grad_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_step_total_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_maybe_update_stats_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_compute_steps_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_apply_steps_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_aux_adamw_s', 0.0) / updates,
+                1000.0 * profile_stats.get('host_to_device_and_mixup_s', 0.0) / batches,
+                1000.0 * profile_stats.get('forward_s', 0.0) / batches,
+                1000.0 * profile_stats.get('backward_s', 0.0) / batches,
+                1000.0 * profile_stats.get('backward_plus_step_s', 0.0) / batches,
+            )
+
     loss_avg = losses_m.avg
     if args.distributed:
         # synchronize avg loss, each process keeps its own running avg
         loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
         loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
-    return OrderedDict([('loss', loss_avg)])
+    metrics = OrderedDict([('loss', loss_avg)])
+    if profile_enabled:
+        updates = max(1, int(profile_counts.get('updates', 0)))
+        batches = max(1, int(profile_counts.get('batches', 0)))
+        metrics['profile_step_ms'] = 1000.0 * profile_stats.get('optimizer_step_s', 0.0) / updates
+        metrics['profile_zero_grad_ms'] = 1000.0 * profile_stats.get('optimizer_zero_grad_s', 0.0) / updates
+        metrics['profile_forward_ms'] = 1000.0 * profile_stats.get('forward_s', 0.0) / batches
+        metrics['profile_backward_ms'] = 1000.0 * profile_stats.get('backward_s', 0.0) / batches
+        metrics['profile_h2d_mixup_ms'] = 1000.0 * profile_stats.get('host_to_device_and_mixup_s', 0.0) / batches
+        if profile_stats.get('kfac_step_total_s', 0.0) > 0.0:
+            metrics['profile_kfac_total_ms'] = 1000.0 * profile_stats.get('kfac_step_total_s', 0.0) / updates
+            metrics['profile_kfac_stats_ms'] = 1000.0 * profile_stats.get('kfac_maybe_update_stats_s', 0.0) / updates
+            metrics['profile_kfac_solve_ms'] = 1000.0 * profile_stats.get('kfac_compute_steps_s', 0.0) / updates
+            metrics['profile_kfac_apply_ms'] = 1000.0 * profile_stats.get('kfac_apply_steps_s', 0.0) / updates
+            metrics['profile_kfac_aux_ms'] = 1000.0 * profile_stats.get('kfac_aux_adamw_s', 0.0) / updates
+    return metrics
 
 
 def validate(
