@@ -688,8 +688,18 @@ class _KFACReduce:
         self.eye_a = {}
         self.eye_g = {}
         self.state = {module: {} for module in self.modules}
+        self._profile_enabled = False
+        self._profile_totals: Optional[dict] = None
         self._init_buffers()
         self._register_hooks()
+
+    def set_profile(self, enabled: bool, totals: Optional[dict] = None) -> None:
+        self._profile_enabled = bool(enabled)
+        self._profile_totals = totals
+
+    def _prof_add(self, key: str, dt: float) -> None:
+        if self._profile_enabled and self._profile_totals is not None:
+            self._profile_totals[key] += float(dt)
 
     @staticmethod
     def _weight_matrix_shape(module: nn.Module) -> tuple[int, int]:
@@ -877,7 +887,14 @@ class _KFACReduce:
 
     @torch.no_grad()
     def compute_steps(self, lr: float) -> list[tuple[nn.Parameter, torch.Tensor, float, float]]:
+        t_pack_total = 0.0
+        t_precond_in_total = 0.0
+        t_muon_ns_total = 0.0
+        t_precond_out_total = 0.0
+        t_unpack_total = 0.0
+
         groups = defaultdict(list)
+        pack_start = time.perf_counter() if self._profile_enabled else None
         for module in self.modules:
             if module.weight.grad is None:
                 continue
@@ -885,9 +902,13 @@ class _KFACReduce:
             update_2d = self._apply_gradient_momentum(module, grad_2d)
             key = (update_2d.shape[0], update_2d.shape[1], update_2d.device, update_2d.dtype)
             groups[key].append((module, update_2d))
+        if self._profile_enabled:
+            t_pack_total += time.perf_counter() - pack_start
 
         steps_for_params = []
         for modules in groups.values():
+            if self._profile_enabled:
+                pack_start = time.perf_counter()
             p_batch = []
             la_batch = []
             lg_batch = []
@@ -901,10 +922,18 @@ class _KFACReduce:
             p_batch = torch.stack(p_batch, dim=0).contiguous()
             la_batch = torch.stack(la_batch, dim=0).contiguous()
             lg_batch = torch.stack(lg_batch, dim=0).contiguous()
+            if self._profile_enabled:
+                t_pack_total += time.perf_counter() - pack_start
 
+            if self._profile_enabled:
+                solve_in_start = time.perf_counter()
             tmp = torch.linalg.solve_triangular(lg_batch, p_batch, upper=False)
             p_hat = torch.linalg.solve_triangular(la_batch, tmp.transpose(-2, -1), upper=False).transpose(-2, -1)
+            if self._profile_enabled:
+                t_precond_in_total += time.perf_counter() - solve_in_start
 
+            if self._profile_enabled:
+                ns_start = time.perf_counter()
             q_hat = _muon_quintic_ns(
                 p_hat,
                 ns_steps=self.cfg.muon_ns_steps,
@@ -912,14 +941,22 @@ class _KFACReduce:
                 eps=self.cfg.muon_ns_eps,
             )
             x_hat = -float(self.cfg.muon_eps) * q_hat
+            if self._profile_enabled:
+                t_muon_ns_total += time.perf_counter() - ns_start
 
+            if self._profile_enabled:
+                solve_out_start = time.perf_counter()
             tmp2 = torch.linalg.solve_triangular(lg_batch.transpose(-2, -1), x_hat, upper=True)
             x_batch = torch.linalg.solve_triangular(
                 la_batch.transpose(-2, -1),
                 tmp2.transpose(-2, -1),
                 upper=True,
             ).transpose(-2, -1)
+            if self._profile_enabled:
+                t_precond_out_total += time.perf_counter() - solve_out_start
 
+            if self._profile_enabled:
+                unpack_start = time.perf_counter()
             for idx, module in enumerate(meta_modules):
                 step = x_batch[idx].reshape_as(module.weight)
                 step_lr = _adjust_muon_lr(
@@ -928,6 +965,8 @@ class _KFACReduce:
                     mode=self.cfg.lr_adjustment,
                 )
                 steps_for_params.append((module.weight, step, lr, step_lr))
+            if self._profile_enabled:
+                t_unpack_total += time.perf_counter() - unpack_start
 
         if self.cfg.max_step_norm is not None and steps_for_params:
             sq_norm = torch.zeros((), device=steps_for_params[0][0].device, dtype=torch.float32)
@@ -939,6 +978,13 @@ class _KFACReduce:
                 (param, step * scale, wd_lr, step_lr)
                 for param, step, wd_lr, step_lr in steps_for_params
             ]
+
+        if self._profile_enabled:
+            self._prof_add('kfac_solve_pack_s', t_pack_total)
+            self._prof_add('kfac_solve_precond_in_s', t_precond_in_total)
+            self._prof_add('kfac_solve_muon_ns_s', t_muon_ns_total)
+            self._prof_add('kfac_solve_precond_out_s', t_precond_out_total)
+            self._prof_add('kfac_solve_unpack_s', t_unpack_total)
 
         return steps_for_params
 
@@ -1029,6 +1075,7 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
 
     def set_profile_enabled(self, enabled: bool) -> None:
         self._profile_enabled = bool(enabled)
+        self._kfac.set_profile(self._profile_enabled, self._profile_totals)
 
     def reset_profile_stats(self) -> None:
         self._profile_totals.clear()
@@ -2612,7 +2659,8 @@ def train_one_epoch(
             batches = max(1, int(profile_counts.get('batches', 0)))
             _logger.info(
                 'Runtime profile epoch %d | per-update ms: step=%.3f zero_grad=%.3f kfac_total=%.3f '
-                'kfac_stats=%.3f kfac_solve=%.3f kfac_apply=%.3f aux_adamw=%.3f '
+                'kfac_stats=%.3f kfac_solve=%.3f (in=%.3f ns=%.3f out=%.3f pack=%.3f unpack=%.3f) '
+                'kfac_apply=%.3f aux_adamw=%.3f '
                 '| per-batch ms: h2d+mixup=%.3f fw=%.3f bw=%.3f bw+step(fp16)=%.3f',
                 epoch,
                 1000.0 * profile_stats.get('optimizer_step_s', 0.0) / updates,
@@ -2620,6 +2668,11 @@ def train_one_epoch(
                 1000.0 * profile_stats.get('kfac_step_total_s', 0.0) / updates,
                 1000.0 * profile_stats.get('kfac_maybe_update_stats_s', 0.0) / updates,
                 1000.0 * profile_stats.get('kfac_compute_steps_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_solve_precond_in_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_solve_muon_ns_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_solve_precond_out_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_solve_pack_s', 0.0) / updates,
+                1000.0 * profile_stats.get('kfac_solve_unpack_s', 0.0) / updates,
                 1000.0 * profile_stats.get('kfac_apply_steps_s', 0.0) / updates,
                 1000.0 * profile_stats.get('kfac_aux_adamw_s', 0.0) / updates,
                 1000.0 * profile_stats.get('host_to_device_and_mixup_s', 0.0) / batches,
@@ -2646,6 +2699,11 @@ def train_one_epoch(
             metrics['profile_kfac_total_ms'] = 1000.0 * profile_stats.get('kfac_step_total_s', 0.0) / updates
             metrics['profile_kfac_stats_ms'] = 1000.0 * profile_stats.get('kfac_maybe_update_stats_s', 0.0) / updates
             metrics['profile_kfac_solve_ms'] = 1000.0 * profile_stats.get('kfac_compute_steps_s', 0.0) / updates
+            metrics['profile_kfac_solve_precond_in_ms'] = 1000.0 * profile_stats.get('kfac_solve_precond_in_s', 0.0) / updates
+            metrics['profile_kfac_solve_muon_ns_ms'] = 1000.0 * profile_stats.get('kfac_solve_muon_ns_s', 0.0) / updates
+            metrics['profile_kfac_solve_precond_out_ms'] = 1000.0 * profile_stats.get('kfac_solve_precond_out_s', 0.0) / updates
+            metrics['profile_kfac_solve_pack_ms'] = 1000.0 * profile_stats.get('kfac_solve_pack_s', 0.0) / updates
+            metrics['profile_kfac_solve_unpack_ms'] = 1000.0 * profile_stats.get('kfac_solve_unpack_s', 0.0) / updates
             metrics['profile_kfac_apply_ms'] = 1000.0 * profile_stats.get('kfac_apply_steps_s', 0.0) / updates
             metrics['profile_kfac_aux_ms'] = 1000.0 * profile_stats.get('kfac_aux_adamw_s', 0.0) / updates
     return metrics
