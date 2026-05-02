@@ -212,6 +212,11 @@ group.add_argument('--layer-decay-no-opt-scale', type=float, default=None,
 group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwargs)
 group.add_argument('--kfac-damping', type=float, default=1e-3,
                    help='KFAC damping for --opt kfac_muon (default: 1e-3)')
+group.add_argument('--kfac-pi-scale', type=str, default='trace',
+                   choices=['trace', 'diag_median', 'diag_trimmed_mean'],
+                   help='Scale estimator for pi balancing between A/G in KFAC (default: trace)')
+group.add_argument('--kfac-pi-trim-fraction', type=float, default=0.1,
+                   help='Trim fraction in [0, 0.5) for --kfac-pi-scale=diag_trimmed_mean (default: 0.1)')
 group.add_argument('--kfac-damping-schedule', type=str, default='none',
                    choices=['none', 'linear', 'cosine'],
                    help='Optional epoch-wise schedule for KFAC damping in --opt kfac_muon (default: none)')
@@ -651,6 +656,8 @@ def _adjust_muon_lr(lr: float, matrix_shape: tuple[int, int], mode: str) -> floa
 @dataclass
 class _KFACConfig:
     damping: float = 1e-3
+    pi_scale: str = 'trace'
+    pi_trim_fraction: float = 0.1
     ema_decay: float = 0.95
     stats_update_every: int = 20
     factor_update_every: int = 20
@@ -749,11 +756,34 @@ class _KFACReduce:
             return 0.0, 0.0
         a = self.stats[module]['A']
         g = self.stats[module]['G']
-        mean_a = max(torch.trace(a).item() / a.shape[0], 1e-12)
-        mean_g = max(torch.trace(g).item() / g.shape[0], 1e-12)
-        pi = math.sqrt(mean_a / mean_g)
+        scale_a = self._factor_scale(a)
+        scale_g = self._factor_scale(g)
+        pi = math.sqrt(scale_a / scale_g)
         root = math.sqrt(self.cfg.damping)
         return pi * root, root / pi
+
+    def _factor_scale(self, factor: torch.Tensor) -> float:
+        mode = self.cfg.pi_scale
+        if mode == 'trace':
+            return max(torch.trace(factor).item() / factor.shape[0], 1e-12)
+
+        diag = torch.diagonal(factor).float()
+        if mode == 'diag_median':
+            return max(torch.median(diag).item(), 1e-12)
+
+        if mode == 'diag_trimmed_mean':
+            trim = float(self.cfg.pi_trim_fraction)
+            if trim <= 0.0 or diag.numel() <= 2:
+                return max(diag.mean().item(), 1e-12)
+            sorted_diag, _ = torch.sort(diag)
+            n = int(sorted_diag.numel())
+            k = int(n * trim)
+            if k * 2 >= n:
+                return max(diag.mean().item(), 1e-12)
+            core = sorted_diag[k:n - k]
+            return max(core.mean().item(), 1e-12)
+
+        raise ValueError(f'Unknown KFAC pi_scale mode: {mode}')
 
     @staticmethod
     def _sym(matrix: torch.Tensor) -> torch.Tensor:
@@ -1137,6 +1167,10 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         )
     if args.kfac_damping < 0.0:
         raise ValueError(f'--kfac-damping must be >= 0 for kfac_muon, got {args.kfac_damping}')
+    if not 0.0 <= args.kfac_pi_trim_fraction < 0.5:
+        raise ValueError(
+            f'--kfac-pi-trim-fraction must be in [0, 0.5), got {args.kfac_pi_trim_fraction}'
+        )
     if args.kfac_damping_final is not None and args.kfac_damping_final < 0.0:
         raise ValueError(f'--kfac-damping-final must be >= 0 for kfac_muon, got {args.kfac_damping_final}')
     if args.kfac_damping_start_epoch < 0:
@@ -1151,6 +1185,8 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
     eps = 1e-8 if args.opt_eps is None else args.opt_eps
     kfac_cfg = _KFACConfig(
         damping=args.kfac_damping,
+        pi_scale=args.kfac_pi_scale,
+        pi_trim_fraction=args.kfac_pi_trim_fraction,
         ema_decay=args.kfac_ema_decay,
         stats_update_every=args.kfac_stats_update_every,
         factor_update_every=args.kfac_factor_update_every,
@@ -2097,6 +2133,11 @@ def main():
                 final_damping,
                 args.kfac_damping_start_epoch,
                 end_epoch,
+            )
+            _logger.info(
+                'KFAC pi balancing: scale=%s trim_fraction=%g',
+                args.kfac_pi_scale,
+                args.kfac_pi_trim_fraction,
             )
 
     results = []
