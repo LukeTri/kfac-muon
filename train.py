@@ -232,6 +232,9 @@ group.add_argument('--no-kfac-lm-adapt-damping', dest='kfac_lm_adapt_damping', a
                    help='Disable Chapter-6 damping adaptation and use static/epoch-wise damping for --opt kfac_muon')
 group.add_argument('--kfac-lm-update-every', type=int, default=5,
                    help='Update interval T1 (in optimizer steps) for LM damping adaptation in --opt kfac_muon (default: 5)')
+group.add_argument('--kfac-lm-log-every', type=int, default=None,
+                   help='Log frequency (in optimizer steps) for LM damping updates in --opt kfac_muon '
+                        '(default: use --log-interval)')
 group.add_argument('--kfac-lm-decay-base', type=float, default=19.0 / 20.0,
                    help='Per-step decay base used to form omega1=(decay_base^T1) in LM damping adaptation (default: 19/20)')
 group.add_argument('--kfac-lm-rho-low', type=float, default=0.25,
@@ -1304,6 +1307,10 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         raise ValueError(
             f'--kfac-lm-update-every must be > 0 for kfac_muon, got {args.kfac_lm_update_every}'
         )
+    if args.kfac_lm_log_every is not None and args.kfac_lm_log_every <= 0:
+        raise ValueError(
+            f'--kfac-lm-log-every must be > 0 when set, got {args.kfac_lm_log_every}'
+        )
     if not 0.0 < args.kfac_lm_decay_base < 1.0:
         raise ValueError(
             f'--kfac-lm-decay-base must be in (0, 1) for kfac_muon, got {args.kfac_lm_decay_base}'
@@ -2305,9 +2312,11 @@ def main():
             f'LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
         if isinstance(optimizer, KFACMuonOptimizer):
             if args.kfac_lm_adapt_damping:
+                kfac_lm_log_every = int(args.log_interval if args.kfac_lm_log_every is None else args.kfac_lm_log_every)
                 _logger.info(
-                    'KFAC LM damping: enabled interval=%d omega1=%.8f rho_low=%.3f rho_high=%.3f replay_mode=%s clamp=[%.3g, %.3g]',
+                    'KFAC LM damping: enabled interval=%d log_every=%d omega1=%.8f rho_low=%.3f rho_high=%.3f replay_mode=%s clamp=[%.3g, %.3g]',
                     args.kfac_lm_update_every,
+                    kfac_lm_log_every,
                     _kfac_lm_omega1(args),
                     args.kfac_lm_rho_low,
                     args.kfac_lm_rho_high,
@@ -2519,6 +2528,7 @@ def train_one_epoch(
     profile_stats = defaultdict(float)
     profile_counts = defaultdict(int)
     kfac_lm_enabled = isinstance(optimizer, KFACMuonOptimizer) and bool(getattr(args, 'kfac_lm_adapt_damping', False))
+    kfac_lm_log_every = int(args.log_interval if args.kfac_lm_log_every is None else args.kfac_lm_log_every)
     kfac_lm_replay_batches = []
     kfac_lm_pre_loss_sum = 0.0
     kfac_lm_pre_loss_weight = 0.0
@@ -2778,7 +2788,10 @@ def train_one_epoch(
                 kfac_lm_update_count += 1
                 if math.isfinite(rho):
                     kfac_lm_rho_sum += rho
-                if utils.is_primary(args):
+                if utils.is_primary(args) and (
+                        ((num_updates + 1) % kfac_lm_log_every == 0)
+                        or last_batch
+                ):
                     _logger.info(
                         'KFAC LM @ update %d: rho=%s pre=%.6g post=%.6g pred=%.6g damping %.6g -> %.6g',
                         num_updates + 1,
