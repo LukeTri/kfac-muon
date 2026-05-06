@@ -238,6 +238,9 @@ group.add_argument('--kfac-lm-rho-low', type=float, default=0.25,
                    help='Lower rho threshold for increasing damping in LM adaptation (default: 0.25)')
 group.add_argument('--kfac-lm-rho-high', type=float, default=0.75,
                    help='Upper rho threshold for decreasing damping in LM adaptation (default: 0.75)')
+group.add_argument('--kfac-lm-replay-mode', type=str, default='train', choices=['train', 'eval'],
+                   help='Model mode used for the extra forward pass h(theta+delta) in LM rho estimation. '
+                        '"train" matches the usual training forward pass definition of h(theta) (default: train).')
 group.add_argument('--kfac-lm-damping-min', type=float, default=1e-9,
                    help='Minimum allowed KFAC damping during LM adaptation (default: 1e-9)')
 group.add_argument('--kfac-lm-damping-max', type=float, default=1e3,
@@ -1305,10 +1308,15 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         raise ValueError(
             f'--kfac-lm-decay-base must be in (0, 1) for kfac_muon, got {args.kfac_lm_decay_base}'
         )
-    if not 0.0 <= args.kfac_lm_rho_low < args.kfac_lm_rho_high <= 1.0:
+    if not math.isfinite(args.kfac_lm_rho_low) or not math.isfinite(args.kfac_lm_rho_high):
         raise ValueError(
-            '--kfac-lm-rho-low and --kfac-lm-rho-high must satisfy '
-            f'0 <= low < high <= 1, got low={args.kfac_lm_rho_low}, high={args.kfac_lm_rho_high}'
+            '--kfac-lm-rho-low and --kfac-lm-rho-high must be finite, '
+            f'got low={args.kfac_lm_rho_low}, high={args.kfac_lm_rho_high}'
+        )
+    if not args.kfac_lm_rho_low < args.kfac_lm_rho_high:
+        raise ValueError(
+            '--kfac-lm-rho-low and --kfac-lm-rho-high must satisfy low < high, '
+            f'got low={args.kfac_lm_rho_low}, high={args.kfac_lm_rho_high}'
         )
     if args.kfac_lm_damping_min < 0.0:
         raise ValueError(
@@ -2298,11 +2306,12 @@ def main():
         if isinstance(optimizer, KFACMuonOptimizer):
             if args.kfac_lm_adapt_damping:
                 _logger.info(
-                    'KFAC LM damping: enabled interval=%d omega1=%.8f rho_low=%.3f rho_high=%.3f clamp=[%.3g, %.3g]',
+                    'KFAC LM damping: enabled interval=%d omega1=%.8f rho_low=%.3f rho_high=%.3f replay_mode=%s clamp=[%.3g, %.3g]',
                     args.kfac_lm_update_every,
                     _kfac_lm_omega1(args),
                     args.kfac_lm_rho_low,
                     args.kfac_lm_rho_high,
+                    args.kfac_lm_replay_mode,
                     args.kfac_lm_damping_min,
                     args.kfac_lm_damping_max,
                 )
@@ -2728,8 +2737,15 @@ def train_one_epoch(
                 post_loss_sum = 0.0
                 post_loss_weight = 0.0
                 was_training = model.training
-                model.eval()
                 try:
+                    # Match LM ratio computation to the definition of h(theta) used for pre-loss.
+                    # Default "train" mode avoids a systematic train/eval mismatch (e.g., drop_path).
+                    if args.kfac_lm_replay_mode == 'eval':
+                        model.eval()
+                    elif args.kfac_lm_replay_mode == 'train':
+                        model.train(True)
+                    else:
+                        raise ValueError(f'Unknown --kfac-lm-replay-mode: {args.kfac_lm_replay_mode}')
                     with torch.no_grad():
                         for replay_input, replay_target, replay_weight in kfac_lm_replay_batches:
                             with amp_autocast():
