@@ -100,6 +100,14 @@ class Hyperparameters:
     kfac_muon_ns_eps = float(os.environ.get("KFAC_MUON_NS_EPS", 1e-7))
     kfac_weight_decay = float(os.environ.get("KFAC_WEIGHT_DECAY", 0.0))
     kfac_muon_lr_adjustment = os.environ.get("KFAC_MUON_LR_ADJUSTMENT", "none")
+    kfac_lm_adapt_damping = bool(int(os.environ.get("KFAC_LM_ADAPT_DAMPING", "1")))
+    kfac_lm_update_every = int(os.environ.get("KFAC_LM_UPDATE_EVERY", 5))
+    kfac_lm_decay_base = float(os.environ.get("KFAC_LM_DECAY_BASE", 19.0 / 20.0))
+    kfac_lm_rho_low = float(os.environ.get("KFAC_LM_RHO_LOW", 0.25))
+    kfac_lm_rho_high = float(os.environ.get("KFAC_LM_RHO_HIGH", 0.75))
+    kfac_lm_replay_mode = os.environ.get("KFAC_LM_REPLAY_MODE", "train").lower()
+    kfac_lm_damping_min = float(os.environ.get("KFAC_LM_DAMPING_MIN", 1e-9))
+    kfac_lm_damping_max = float(os.environ.get("KFAC_LM_DAMPING_MAX", 1e3))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -227,6 +235,23 @@ def _adjust_muon_lr(lr: float, shape: tuple[int, int], mode: str) -> float:
     return lr
 
 
+def _kfac_lm_omega1(args: Hyperparameters) -> float:
+    interval = max(1, int(args.kfac_lm_update_every))
+    return float(args.kfac_lm_decay_base) ** interval
+
+
+def _kfac_lm_adjusted_damping(current_damping: float, rho: float, args: Hyperparameters) -> float:
+    omega1 = _kfac_lm_omega1(args)
+    damping = float(current_damping)
+    if not math.isfinite(rho):
+        damping /= max(omega1, 1e-12)
+    elif rho > float(args.kfac_lm_rho_high):
+        damping *= omega1
+    elif rho < float(args.kfac_lm_rho_low):
+        damping /= max(omega1, 1e-12)
+    return max(float(args.kfac_lm_damping_min), min(damping, float(args.kfac_lm_damping_max)))
+
+
 class KFACMuonExpand(torch.optim.Optimizer):
     """KFAC-Muon variant for token-level LM losses using expand-style factor stats."""
 
@@ -259,6 +284,8 @@ class KFACMuonExpand(torch.optim.Optimizer):
         self._handles = []
         self._distributed = dist.is_available() and dist.is_initialized()
         self._world_size = dist.get_world_size() if self._distributed else 1
+        self._kfac_step_calls = 0
+        self._last_kfac_model_delta = 0.0
 
         self._accum = {}
         for module in self.modules:
@@ -285,6 +312,18 @@ class KFACMuonExpand(torch.optim.Optimizer):
         self.cfg.momentum = momentum
         for group in self.param_groups:
             group["momentum"] = momentum
+
+    def set_damping(self, damping: float) -> None:
+        self.cfg.damping = max(0.0, float(damping))
+
+    def get_damping(self) -> float:
+        return float(self.cfg.damping)
+
+    def get_last_model_delta(self) -> float:
+        return float(self._last_kfac_model_delta)
+
+    def get_step_calls(self) -> int:
+        return int(self._kfac_step_calls)
 
     @torch.no_grad()
     def _forward_hook(self, module: nn.Module, inputs, output) -> None:
@@ -376,6 +415,7 @@ class KFACMuonExpand(torch.optim.Optimizer):
         group = self.param_groups[0]
         lr = float(group["lr"])
         momentum = float(group.get("momentum", self.cfg.momentum))
+        grad_step_dot = 0.0
 
         for module in self.modules:
             param = module.weight
@@ -383,7 +423,8 @@ class KFACMuonExpand(torch.optim.Optimizer):
             if grad is None:
                 continue
             state = self.state[param]
-            grad_2d = grad.reshape(param.shape[0], -1).float()
+            raw_grad_2d = grad.reshape(param.shape[0], -1).float()
+            grad_2d = raw_grad_2d
             if momentum > 0.0:
                 buf = state.get("momentum_buffer", None)
                 if buf is None or buf.shape != grad_2d.shape:
@@ -413,10 +454,13 @@ class KFACMuonExpand(torch.optim.Optimizer):
                 (grad_2d.shape[0], grad_2d.shape[1]),
                 self.cfg.lr_adjustment,
             )
+            grad_step_dot += float((raw_grad_2d * step_2d * step_lr).sum().item())
             if self.cfg.weight_decay != 0.0:
                 param.mul_(1.0 - lr * self.cfg.weight_decay)
             param.add_(step_2d.reshape_as(param).to(dtype=param.dtype), alpha=step_lr)
 
+        self._last_kfac_model_delta = 0.5 * grad_step_dot
+        self._kfac_step_calls += 1
         return loss
 
 
@@ -993,6 +1037,23 @@ def main() -> None:
             "MATRIX_OPTIMIZER must be one of {'muon', 'kfac_muon_expand'}; "
             f"got '{args.matrix_optimizer}'"
         )
+    if matrix_optimizer_name == "kfac_muon_expand":
+        if args.kfac_lm_update_every <= 0:
+            raise ValueError(f"KFAC_LM_UPDATE_EVERY must be > 0, got {args.kfac_lm_update_every}")
+        if not 0.0 < args.kfac_lm_decay_base < 1.0:
+            raise ValueError(f"KFAC_LM_DECAY_BASE must be in (0, 1), got {args.kfac_lm_decay_base}")
+        if not (math.isfinite(args.kfac_lm_rho_low) and math.isfinite(args.kfac_lm_rho_high)):
+            raise ValueError("KFAC_LM_RHO_LOW/HIGH must be finite.")
+        if not args.kfac_lm_rho_low < args.kfac_lm_rho_high:
+            raise ValueError(
+                f"KFAC_LM_RHO_LOW must be < KFAC_LM_RHO_HIGH, got {args.kfac_lm_rho_low} >= {args.kfac_lm_rho_high}"
+            )
+        if args.kfac_lm_damping_min < 0.0 or args.kfac_lm_damping_max < args.kfac_lm_damping_min:
+            raise ValueError(
+                f"KFAC_LM_DAMPING bounds invalid: min={args.kfac_lm_damping_min}, max={args.kfac_lm_damping_max}"
+            )
+        if args.kfac_lm_replay_mode not in {"train", "eval"}:
+            raise ValueError(f"KFAC_LM_REPLAY_MODE must be one of {{'train','eval'}}, got {args.kfac_lm_replay_mode}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1209,6 +1270,15 @@ def main() -> None:
             f"muon_eps={args.kfac_muon_eps} ns_steps={args.kfac_muon_ns_steps} "
             f"lr_adjustment={args.kfac_muon_lr_adjustment} momentum={args.kfac_momentum}"
         )
+        if args.kfac_lm_adapt_damping:
+            log0(
+                "kfac_lm:"
+                f"enabled update_every={args.kfac_lm_update_every} omega1={_kfac_lm_omega1(args):.8f} "
+                f"rho_low={args.kfac_lm_rho_low} rho_high={args.kfac_lm_rho_high} replay_mode={args.kfac_lm_replay_mode} "
+                f"clamp=[{args.kfac_lm_damping_min}, {args.kfac_lm_damping_max}]"
+            )
+        else:
+            log0("kfac_lm:disabled")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1275,6 +1345,18 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    kfac_lm_enabled = (
+        matrix_optimizer_name == "kfac_muon_expand"
+        and isinstance(optimizer_matrix, KFACMuonExpand)
+        and bool(args.kfac_lm_adapt_damping)
+    )
+    kfac_lm_updates = 0
+    kfac_lm_rho_sum = 0.0
+    kfac_lm_rho_count = 0
+    kfac_lm_rho_last = float("nan")
+    kfac_lm_recent_updates = 0
+    kfac_lm_recent_rho_sum = 0.0
+    kfac_lm_recent_rho_count = 0
 
     step = 0
     while True:
@@ -1313,6 +1395,10 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        use_kfac_lm_this_update = kfac_lm_enabled and ((step + 1) % int(args.kfac_lm_update_every) == 0)
+        kfac_lm_pre_loss_sum = 0.0
+        kfac_lm_pre_loss_weight = 0.0
+        kfac_lm_replay_batches = []
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1322,6 +1408,11 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
+            if use_kfac_lm_this_update:
+                w = float(x.numel())
+                kfac_lm_pre_loss_sum += float(loss.detach().item()) * w
+                kfac_lm_pre_loss_weight += w
+                kfac_lm_replay_batches.append((x.detach().clone(), y.detach().clone(), w))
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
@@ -1338,10 +1429,51 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        kfac_step_calls_before = optimizer_matrix.get_step_calls() if use_kfac_lm_this_update else None
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if use_kfac_lm_this_update:
+            step_executed = kfac_step_calls_before is not None and optimizer_matrix.get_step_calls() > kfac_step_calls_before
+            if step_executed and kfac_lm_pre_loss_weight > 0.0 and kfac_lm_replay_batches:
+                was_training = model.training
+                if args.kfac_lm_replay_mode == "eval":
+                    model.eval()
+                else:
+                    model.train(True)
+                post_sum = 0.0
+                post_weight = 0.0
+                try:
+                    with torch.no_grad():
+                        for replay_x, replay_y, replay_w in kfac_lm_replay_batches:
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                                replay_loss = model(replay_x, replay_y)
+                            post_sum += float(replay_loss.detach().item()) * replay_w
+                            post_weight += replay_w
+                finally:
+                    model.train(was_training)
+                stats = torch.tensor(
+                    [kfac_lm_pre_loss_sum, kfac_lm_pre_loss_weight, post_sum, post_weight, optimizer_matrix.get_last_model_delta()],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                if distributed:
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                pre_loss = float((stats[0] / max(stats[1], 1e-12)).item())
+                post_loss = float((stats[2] / max(stats[3], 1e-12)).item())
+                predicted = float((stats[4] / float(world_size if distributed else 1)).item())
+                actual_delta = post_loss - pre_loss
+                rho = actual_delta / predicted if abs(predicted) > 1e-12 else float("nan")
+                optimizer_matrix.set_damping(_kfac_lm_adjusted_damping(optimizer_matrix.get_damping(), rho, args))
+                kfac_lm_updates += 1
+                kfac_lm_recent_updates += 1
+                kfac_lm_rho_last = rho
+                if math.isfinite(rho):
+                    kfac_lm_rho_sum += rho
+                    kfac_lm_rho_count += 1
+                    kfac_lm_recent_rho_sum += rho
+                    kfac_lm_recent_rho_count += 1
         zero_grad_all()
 
         step += 1
@@ -1351,10 +1483,35 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            lm_suffix = ""
+            if matrix_optimizer_name == "kfac_muon_expand" and isinstance(optimizer_matrix, KFACMuonExpand):
+                lm_suffix = f" kfac_damping:{optimizer_matrix.get_damping():.6g}"
+                if kfac_lm_updates > 0:
+                    rho_avg_total = (
+                        kfac_lm_rho_sum / kfac_lm_rho_count
+                        if kfac_lm_rho_count > 0
+                        else float("nan")
+                    )
+                    rho_avg_recent = (
+                        kfac_lm_recent_rho_sum / kfac_lm_recent_rho_count
+                        if kfac_lm_recent_rho_count > 0
+                        else float("nan")
+                    )
+                    lm_suffix += (
+                        f" kfac_lm_updates:{kfac_lm_updates}"
+                        f" kfac_lm_rho_last:{kfac_lm_rho_last:.4f}"
+                        f" kfac_lm_rho_recent:{rho_avg_recent:.4f}"
+                        f" kfac_lm_updates_recent:{kfac_lm_recent_updates}"
+                        f" kfac_lm_rho_avg:{rho_avg_total:.4f}"
+                    )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{lm_suffix}"
             )
+            kfac_lm_recent_updates = 0
+            kfac_lm_recent_rho_sum = 0.0
+            kfac_lm_recent_rho_count = 0
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
