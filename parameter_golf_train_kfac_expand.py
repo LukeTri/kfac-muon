@@ -108,6 +108,10 @@ class Hyperparameters:
     kfac_lm_replay_mode = os.environ.get("KFAC_LM_REPLAY_MODE", "train").lower()
     kfac_lm_damping_min = float(os.environ.get("KFAC_LM_DAMPING_MIN", 1e-9))
     kfac_lm_damping_max = float(os.environ.get("KFAC_LM_DAMPING_MAX", 1e3))
+    kfac_debug_eig_above_damping = bool(int(os.environ.get("KFAC_DEBUG_EIG_ABOVE_DAMPING", "0")))
+    kfac_debug_eig_max_dim = int(os.environ.get("KFAC_DEBUG_EIG_MAX_DIM", 0))
+    kfac_debug_eig_once_step = int(os.environ.get("KFAC_DEBUG_EIG_ONCE_STEP", 200))
+    kfac_debug_eig_every_log = bool(int(os.environ.get("KFAC_DEBUG_EIG_EVERY_LOG", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -324,6 +328,66 @@ class KFACMuonExpand(torch.optim.Optimizer):
 
     def get_step_calls(self) -> int:
         return int(self._kfac_step_calls)
+
+    @torch.no_grad()
+    def get_eig_above_damping_stats(self, max_dim: int = 0) -> dict[str, float]:
+        damping = float(self.cfg.damping)
+        a_total = 0
+        a_above = 0
+        g_total = 0
+        g_above = 0
+        mat_frac_sum = 0.0
+        mat_frac_count = 0
+        mats_used = 0
+        mats_skipped = 0
+
+        for module in self.modules:
+            weight = module.weight
+            state = self.state.get(weight, None)
+            if state is None:
+                continue
+            for key in ("A", "G"):
+                matrix = state.get(key, None)
+                if matrix is None:
+                    continue
+                if max_dim > 0 and int(matrix.shape[0]) > int(max_dim):
+                    mats_skipped += 1
+                    continue
+                evals = torch.linalg.eigvalsh(_sym_2d(matrix.float()))
+                count = int(evals.numel())
+                if count == 0:
+                    continue
+                above = int((evals > damping).sum().item())
+                frac = float(above) / float(count)
+                mat_frac_sum += frac
+                mat_frac_count += 1
+                mats_used += 1
+                if key == "A":
+                    a_total += count
+                    a_above += above
+                else:
+                    g_total += count
+                    g_above += above
+
+        total = a_total + g_total
+        total_above = a_above + g_above
+        frac_all = float(total_above) / float(total) if total > 0 else float("nan")
+        frac_a = float(a_above) / float(a_total) if a_total > 0 else float("nan")
+        frac_g = float(g_above) / float(g_total) if g_total > 0 else float("nan")
+        frac_mean_matrix = mat_frac_sum / float(mat_frac_count) if mat_frac_count > 0 else float("nan")
+
+        return {
+            "damping": damping,
+            "frac_all": frac_all,
+            "frac_A": frac_a,
+            "frac_G": frac_g,
+            "frac_mean_matrix": frac_mean_matrix,
+            "eig_total": float(total),
+            "eig_total_A": float(a_total),
+            "eig_total_G": float(g_total),
+            "mats_used": float(mats_used),
+            "mats_skipped": float(mats_skipped),
+        }
 
     @torch.no_grad()
     def _forward_hook(self, module: nn.Module, inputs, output) -> None:
@@ -1037,6 +1101,10 @@ def main() -> None:
             "MATRIX_OPTIMIZER must be one of {'muon', 'kfac_muon_expand'}; "
             f"got '{args.matrix_optimizer}'"
         )
+    if args.kfac_debug_eig_max_dim < 0:
+        raise ValueError(f"KFAC_DEBUG_EIG_MAX_DIM must be >= 0, got {args.kfac_debug_eig_max_dim}")
+    if args.kfac_debug_eig_once_step < 0:
+        raise ValueError(f"KFAC_DEBUG_EIG_ONCE_STEP must be >= 0, got {args.kfac_debug_eig_once_step}")
     if matrix_optimizer_name == "kfac_muon_expand":
         if args.kfac_lm_update_every <= 0:
             raise ValueError(f"KFAC_LM_UPDATE_EVERY must be > 0, got {args.kfac_lm_update_every}")
@@ -1270,6 +1338,14 @@ def main() -> None:
             f"muon_eps={args.kfac_muon_eps} ns_steps={args.kfac_muon_ns_steps} "
             f"lr_adjustment={args.kfac_muon_lr_adjustment} momentum={args.kfac_momentum}"
         )
+        if args.kfac_debug_eig_above_damping:
+            log0(
+                "kfac_debug_eig_above_damping:"
+                f"enabled max_dim={args.kfac_debug_eig_max_dim} "
+                f"once_step={args.kfac_debug_eig_once_step} "
+                f"every_log={int(args.kfac_debug_eig_every_log)} "
+                "(max_dim=0 means no matrix-size cap)"
+            )
         if args.kfac_lm_adapt_damping:
             log0(
                 "kfac_lm:"
@@ -1357,6 +1433,7 @@ def main() -> None:
     kfac_lm_recent_updates = 0
     kfac_lm_recent_rho_sum = 0.0
     kfac_lm_recent_rho_count = 0
+    kfac_eig_debug_done = False
 
     step = 0
     while True:
@@ -1484,6 +1561,7 @@ def main() -> None:
         )
         if should_log_train:
             lm_suffix = ""
+            eig_suffix = ""
             if matrix_optimizer_name == "kfac_muon_expand" and isinstance(optimizer_matrix, KFACMuonExpand):
                 lm_suffix = f" kfac_damping:{optimizer_matrix.get_damping():.6g}"
                 if kfac_lm_updates > 0:
@@ -1504,10 +1582,28 @@ def main() -> None:
                         f" kfac_lm_updates_recent:{kfac_lm_recent_updates}"
                         f" kfac_lm_rho_avg:{rho_avg_total:.4f}"
                     )
+                if args.kfac_debug_eig_above_damping and master_process:
+                    should_compute_eig_debug = (
+                        args.kfac_debug_eig_every_log
+                        or (not kfac_eig_debug_done and step >= args.kfac_debug_eig_once_step)
+                    )
+                    if should_compute_eig_debug:
+                        eig_stats = optimizer_matrix.get_eig_above_damping_stats(max_dim=args.kfac_debug_eig_max_dim)
+                        eig_suffix = (
+                            f" kfac_eig_gt_damp_all:{eig_stats['frac_all']:.4f}"
+                            f" kfac_eig_gt_damp_A:{eig_stats['frac_A']:.4f}"
+                            f" kfac_eig_gt_damp_G:{eig_stats['frac_G']:.4f}"
+                            f" kfac_eig_gt_damp_meanmat:{eig_stats['frac_mean_matrix']:.4f}"
+                            f" kfac_eig_mats_used:{int(eig_stats['mats_used'])}"
+                            f" kfac_eig_mats_skipped:{int(eig_stats['mats_skipped'])}"
+                        )
+                        if not args.kfac_debug_eig_every_log:
+                            kfac_eig_debug_done = True
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f"{lm_suffix}"
+                f"{eig_suffix}"
             )
             kfac_lm_recent_updates = 0
             kfac_lm_recent_rho_sum = 0.0
