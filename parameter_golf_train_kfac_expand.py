@@ -88,7 +88,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     matrix_optimizer = os.environ.get("MATRIX_OPTIMIZER", "muon").lower()
 
-    # K-FAC Muon (expand setting for token-level LM losses)
+    # K-FAC Muon (supports expand and reduce factor statistics for token-level LM losses)
     kfac_damping = float(os.environ.get("KFAC_DAMPING", 1.5e-4))
     kfac_ema_decay = float(os.environ.get("KFAC_EMA_DECAY", 0.95))
     kfac_stats_update_every = int(os.environ.get("KFAC_STATS_UPDATE_EVERY", 4))
@@ -100,6 +100,7 @@ class Hyperparameters:
     kfac_muon_ns_eps = float(os.environ.get("KFAC_MUON_NS_EPS", 1e-7))
     kfac_weight_decay = float(os.environ.get("KFAC_WEIGHT_DECAY", 0.0))
     kfac_muon_lr_adjustment = os.environ.get("KFAC_MUON_LR_ADJUSTMENT", "none")
+    kfac_g_damping_mult = float(os.environ.get("KFAC_G_DAMPING_MULT", 1.0))
     kfac_lm_adapt_damping = bool(int(os.environ.get("KFAC_LM_ADAPT_DAMPING", "1")))
     kfac_lm_update_every = int(os.environ.get("KFAC_LM_UPDATE_EVERY", 5))
     kfac_lm_decay_base = float(os.environ.get("KFAC_LM_DECAY_BASE", 19.0 / 20.0))
@@ -208,6 +209,7 @@ class _KFACExpandConfig:
     muon_ns_eps: float = 1e-7
     lr_adjustment: str = "none"
     weight_decay: float = 0.0
+    g_damping_mult: float = 1.0
 
 
 def _sym_2d(matrix: Tensor) -> Tensor:
@@ -329,15 +331,31 @@ class KFACMuonExpand(torch.optim.Optimizer):
     def get_step_calls(self) -> int:
         return int(self._kfac_step_calls)
 
+    def _factor_damping_terms(self, a: Tensor, g: Tensor) -> tuple[float, float, float]:
+        a_scale = max(float(torch.trace(a).item() / max(a.shape[0], 1)), 1e-12)
+        g_scale = max(float(torch.trace(g).item() / max(g.shape[0], 1)), 1e-12)
+        pi = math.sqrt(a_scale / g_scale)
+        damping = float(self.cfg.damping)
+        a_damping = damping * pi
+        g_damping = (damping / max(pi, 1e-12)) * max(float(self.cfg.g_damping_mult), 1e-12)
+        return pi, a_damping, g_damping
+
     @torch.no_grad()
     def get_eig_above_damping_stats(self, max_dim: int = 0) -> dict[str, float]:
         damping = float(self.cfg.damping)
         a_total = 0
-        a_above = 0
+        a_above_raw = 0
+        a_above_eff = 0
         g_total = 0
-        g_above = 0
-        mat_frac_sum = 0.0
+        g_above_raw = 0
+        g_above_eff = 0
+        mat_frac_sum_raw = 0.0
+        mat_frac_sum_eff = 0.0
         mat_frac_count = 0
+        a_eff_damp_sum = 0.0
+        a_eff_damp_count = 0
+        g_eff_damp_sum = 0.0
+        g_eff_damp_count = 0
         mats_used = 0
         mats_skipped = 0
 
@@ -346,6 +364,11 @@ class KFACMuonExpand(torch.optim.Optimizer):
             state = self.state.get(weight, None)
             if state is None:
                 continue
+            a_matrix = state.get("A", None)
+            g_matrix = state.get("G", None)
+            if a_matrix is None or g_matrix is None:
+                continue
+            _, a_damp_eff, g_damp_eff = self._factor_damping_terms(a_matrix.float(), g_matrix.float())
             for key in ("A", "G"):
                 matrix = state.get(key, None)
                 if matrix is None:
@@ -357,31 +380,56 @@ class KFACMuonExpand(torch.optim.Optimizer):
                 count = int(evals.numel())
                 if count == 0:
                     continue
-                above = int((evals > damping).sum().item())
-                frac = float(above) / float(count)
-                mat_frac_sum += frac
+                damp_eff = a_damp_eff if key == "A" else g_damp_eff
+                above_raw = int((evals > damping).sum().item())
+                above_eff = int((evals > damp_eff).sum().item())
+                frac_raw = float(above_raw) / float(count)
+                frac_eff = float(above_eff) / float(count)
+                mat_frac_sum_raw += frac_raw
+                mat_frac_sum_eff += frac_eff
                 mat_frac_count += 1
                 mats_used += 1
                 if key == "A":
                     a_total += count
-                    a_above += above
+                    a_above_raw += above_raw
+                    a_above_eff += above_eff
+                    a_eff_damp_sum += float(damp_eff)
+                    a_eff_damp_count += 1
                 else:
                     g_total += count
-                    g_above += above
+                    g_above_raw += above_raw
+                    g_above_eff += above_eff
+                    g_eff_damp_sum += float(damp_eff)
+                    g_eff_damp_count += 1
 
         total = a_total + g_total
-        total_above = a_above + g_above
-        frac_all = float(total_above) / float(total) if total > 0 else float("nan")
-        frac_a = float(a_above) / float(a_total) if a_total > 0 else float("nan")
-        frac_g = float(g_above) / float(g_total) if g_total > 0 else float("nan")
-        frac_mean_matrix = mat_frac_sum / float(mat_frac_count) if mat_frac_count > 0 else float("nan")
+        total_above_raw = a_above_raw + g_above_raw
+        total_above_eff = a_above_eff + g_above_eff
+        frac_all_raw = float(total_above_raw) / float(total) if total > 0 else float("nan")
+        frac_all_eff = float(total_above_eff) / float(total) if total > 0 else float("nan")
+        frac_a_raw = float(a_above_raw) / float(a_total) if a_total > 0 else float("nan")
+        frac_a_eff = float(a_above_eff) / float(a_total) if a_total > 0 else float("nan")
+        frac_g_raw = float(g_above_raw) / float(g_total) if g_total > 0 else float("nan")
+        frac_g_eff = float(g_above_eff) / float(g_total) if g_total > 0 else float("nan")
+        frac_mean_matrix_raw = mat_frac_sum_raw / float(mat_frac_count) if mat_frac_count > 0 else float("nan")
+        frac_mean_matrix_eff = mat_frac_sum_eff / float(mat_frac_count) if mat_frac_count > 0 else float("nan")
+        mean_a_eff_damp = a_eff_damp_sum / float(a_eff_damp_count) if a_eff_damp_count > 0 else float("nan")
+        mean_g_eff_damp = g_eff_damp_sum / float(g_eff_damp_count) if g_eff_damp_count > 0 else float("nan")
 
         return {
             "damping": damping,
-            "frac_all": frac_all,
-            "frac_A": frac_a,
-            "frac_G": frac_g,
-            "frac_mean_matrix": frac_mean_matrix,
+            # Legacy keys compare against raw lambda (same threshold for A/G).
+            "frac_all": frac_all_raw,
+            "frac_A": frac_a_raw,
+            "frac_G": frac_g_raw,
+            "frac_mean_matrix": frac_mean_matrix_raw,
+            # Effective keys compare against actual per-factor damping.
+            "frac_all_eff": frac_all_eff,
+            "frac_A_eff": frac_a_eff,
+            "frac_G_eff": frac_g_eff,
+            "frac_mean_matrix_eff": frac_mean_matrix_eff,
+            "eff_damp_A_mean": mean_a_eff_damp,
+            "eff_damp_G_mean": mean_g_eff_damp,
             "eig_total": float(total),
             "eig_total_A": float(a_total),
             "eig_total_G": float(g_total),
@@ -454,17 +502,14 @@ class KFACMuonExpand(torch.optim.Optimizer):
                 block["count"] = 0.0
 
         if update_factors:
-            damping = float(self.cfg.damping)
             for module in self.modules:
                 weight = module.weight
                 state = self.state[weight]
                 a = state["A"]
                 g = state["G"]
-                a_scale = max(float(torch.trace(a).item() / max(a.shape[0], 1)), 1e-12)
-                g_scale = max(float(torch.trace(g).item() / max(g.shape[0], 1)), 1e-12)
-                pi = math.sqrt(a_scale / g_scale)
-                a_damped = a + (damping * pi) * torch.eye(a.shape[0], device=a.device, dtype=a.dtype)
-                g_damped = g + (damping / max(pi, 1e-12)) * torch.eye(g.shape[0], device=g.device, dtype=g.dtype)
+                _, a_damping, g_damping = self._factor_damping_terms(a, g)
+                a_damped = a + a_damping * torch.eye(a.shape[0], device=a.device, dtype=a.dtype)
+                g_damped = g + g_damping * torch.eye(g.shape[0], device=g.device, dtype=g.dtype)
                 state["LA"].copy_(_safe_cholesky_2d(a_damped))
                 state["LG"].copy_(_safe_cholesky_2d(g_damped))
 
@@ -526,6 +571,100 @@ class KFACMuonExpand(torch.optim.Optimizer):
         self._last_kfac_model_delta = 0.5 * grad_step_dot
         self._kfac_step_calls += 1
         return loss
+
+
+class KFACMuonReduce(KFACMuonExpand):
+    """KFAC-Muon variant for token-level LM losses using reduce-style factor stats."""
+
+    def __init__(
+        self,
+        modules: list[nn.Module],
+        lr: float,
+        cfg: _KFACExpandConfig,
+    ):
+        super().__init__(modules=modules, lr=lr, cfg=cfg)
+        # Reduce uses per-step cached activations/grads, not cross-step expanded sums.
+        self._cache = {module: {"a": None, "g": None} for module in self.modules}
+        self._accum = {}
+
+    @torch.no_grad()
+    def _forward_hook(self, module: nn.Module, inputs, output) -> None:
+        if not torch.is_tensor(output) or not inputs:
+            return
+        if not output.requires_grad:
+            return
+        act = inputs[0]
+        if not torch.is_tensor(act):
+            return
+        self._cache[module]["a"] = act.detach()
+        self._cache[module]["g"] = None
+
+        def save_grad(grad: Tensor, m: nn.Module = module) -> None:
+            self._cache[m]["g"] = grad.detach()
+
+        output.register_hook(save_grad)
+
+    @staticmethod
+    def _reduce_factors(activations: Tensor, out_grads: Tensor) -> tuple[Tensor, Tensor]:
+        # Reduce setting: aggregate shared axis first, then form per-example covariances.
+        a = activations.float().reshape(activations.shape[0], -1, activations.shape[-1])
+        g = out_grads.float().reshape(out_grads.shape[0], -1, out_grads.shape[-1])
+        batch_size = int(min(a.shape[0], g.shape[0]))
+        if batch_size <= 0:
+            raise ValueError("KFAC reduce received empty batch while computing factors.")
+        a = a[:batch_size]
+        g = g[:batch_size]
+        batch_f = float(batch_size)
+        a_bar = a.mean(dim=1)
+        g_sum = g.sum(dim=1)
+        a_batch = _sym_2d((a_bar.transpose(0, 1) @ a_bar) / batch_f)
+        g_batch = _sym_2d((g_sum.transpose(0, 1) @ g_sum) * batch_f)
+        return a_batch, g_batch
+
+    @torch.no_grad()
+    def _maybe_update_factors(self) -> None:
+        self._step += 1
+        update_stats = self.cfg.stats_update_every > 0 and (self._step % self.cfg.stats_update_every == 0)
+        update_factors = self.cfg.factor_update_every > 0 and (self._step % self.cfg.factor_update_every == 0)
+        if not (update_stats or update_factors):
+            return
+
+        if update_stats:
+            gamma = float(self.cfg.ema_decay)
+            one_minus = 1.0 - gamma
+            for module in self.modules:
+                cache = self._cache.get(module, None)
+                if cache is None:
+                    continue
+                activations = cache.get("a", None)
+                grads = cache.get("g", None)
+                if activations is None or grads is None:
+                    continue
+                a_batch, g_batch = self._reduce_factors(activations, grads)
+                if self._distributed:
+                    dist.all_reduce(a_batch, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(g_batch, op=dist.ReduceOp.SUM)
+                    a_batch /= float(self._world_size)
+                    g_batch /= float(self._world_size)
+                weight = module.weight
+                state = self.state[weight]
+                state["A"].mul_(gamma).add_(a_batch, alpha=one_minus)
+                state["G"].mul_(gamma).add_(g_batch, alpha=one_minus)
+
+        if update_factors:
+            for module in self.modules:
+                weight = module.weight
+                state = self.state[weight]
+                a = state["A"]
+                g = state["G"]
+                _, a_damping, g_damping = self._factor_damping_terms(a, g)
+                a_damped = a + a_damping * torch.eye(a.shape[0], device=a.device, dtype=a.dtype)
+                g_damped = g + g_damping * torch.eye(g.shape[0], device=g.device, dtype=g.dtype)
+                state["LA"].copy_(_safe_cholesky_2d(a_damped))
+                state["LG"].copy_(_safe_cholesky_2d(g_damped))
+
+        for module in self.modules:
+            self._cache[module]["g"] = None
 
 
 # -----------------------------
@@ -1094,18 +1233,25 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     matrix_optimizer_name = args.matrix_optimizer.replace("-", "_")
-    if matrix_optimizer_name == "kfac_muon":
+    if matrix_optimizer_name in {"kfac_muon", "kfac_expand"}:
         matrix_optimizer_name = "kfac_muon_expand"
-    if matrix_optimizer_name not in {"muon", "kfac_muon_expand"}:
+    elif matrix_optimizer_name == "kfac_reduce":
+        matrix_optimizer_name = "kfac_muon_reduce"
+    if matrix_optimizer_name not in {"muon", "kfac_muon_expand", "kfac_muon_reduce"}:
         raise ValueError(
-            "MATRIX_OPTIMIZER must be one of {'muon', 'kfac_muon_expand'}; "
+            "MATRIX_OPTIMIZER must be one of {'muon', 'kfac_muon_expand', 'kfac_muon_reduce'}; "
             f"got '{args.matrix_optimizer}'"
         )
+    using_kfac_muon = matrix_optimizer_name in {"kfac_muon_expand", "kfac_muon_reduce"}
     if args.kfac_debug_eig_max_dim < 0:
         raise ValueError(f"KFAC_DEBUG_EIG_MAX_DIM must be >= 0, got {args.kfac_debug_eig_max_dim}")
     if args.kfac_debug_eig_once_step < 0:
         raise ValueError(f"KFAC_DEBUG_EIG_ONCE_STEP must be >= 0, got {args.kfac_debug_eig_once_step}")
-    if matrix_optimizer_name == "kfac_muon_expand":
+    if using_kfac_muon:
+        if not math.isfinite(args.kfac_g_damping_mult) or args.kfac_g_damping_mult <= 0.0:
+            raise ValueError(
+                f"KFAC_G_DAMPING_MULT must be finite and > 0, got {args.kfac_g_damping_mult}"
+            )
         if args.kfac_lm_update_every <= 0:
             raise ValueError(f"KFAC_LM_UPDATE_EVERY must be > 0, got {args.kfac_lm_update_every}")
         if not 0.0 < args.kfac_lm_decay_base < 1.0:
@@ -1229,9 +1375,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if matrix_optimizer_name == "kfac_muon_expand":
+    if using_kfac_muon:
         compiled_model = base_model
-        log0("compile:disabled for kfac_muon_expand (module hooks require eager graph)")
+        log0(f"compile:disabled for {matrix_optimizer_name} (module hooks require eager graph)")
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -1281,10 +1427,11 @@ def main() -> None:
             matched_ids = {id(module.weight) for module in matrix_modules}
             missing = len(matrix_param_ids - matched_ids)
             raise RuntimeError(
-                "kfac_muon_expand module matching failed: "
+                "kfac_muon module matching failed: "
                 f"matrix_params={len(matrix_params)} matrix_modules={len(matrix_modules)} missing={missing}"
             )
-        optimizer_matrix = KFACMuonExpand(
+        kfac_cls = KFACMuonExpand if matrix_optimizer_name == "kfac_muon_expand" else KFACMuonReduce
+        optimizer_matrix = kfac_cls(
             modules=matrix_modules,
             lr=args.matrix_lr,
             cfg=_KFACExpandConfig(
@@ -1299,6 +1446,7 @@ def main() -> None:
                 muon_ns_eps=args.kfac_muon_ns_eps,
                 lr_adjustment=args.kfac_muon_lr_adjustment,
                 weight_decay=args.kfac_weight_decay,
+                g_damping_mult=args.kfac_g_damping_mult,
             ),
         )
     for group in optimizer_matrix.param_groups:
@@ -1330,13 +1478,14 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(f"matrix_optimizer:{matrix_optimizer_name} matrix_param_tensors:{len(matrix_params)}")
-    if matrix_optimizer_name == "kfac_muon_expand":
+    if using_kfac_muon:
         log0(
-            "kfac_expand:"
+            f"{matrix_optimizer_name}:"
             f"damping={args.kfac_damping} ema_decay={args.kfac_ema_decay} "
             f"stats_every={args.kfac_stats_update_every} factors_every={args.kfac_factor_update_every} "
             f"muon_eps={args.kfac_muon_eps} ns_steps={args.kfac_muon_ns_steps} "
-            f"lr_adjustment={args.kfac_muon_lr_adjustment} momentum={args.kfac_momentum}"
+            f"lr_adjustment={args.kfac_muon_lr_adjustment} momentum={args.kfac_momentum} "
+            f"g_damping_mult={args.kfac_g_damping_mult}"
         )
         if args.kfac_debug_eig_above_damping:
             log0(
@@ -1344,6 +1493,7 @@ def main() -> None:
                 f"enabled max_dim={args.kfac_debug_eig_max_dim} "
                 f"once_step={args.kfac_debug_eig_once_step} "
                 f"every_log={int(args.kfac_debug_eig_every_log)} "
+                f"(effective thresholds use lambda*pi for A and lambda/pi*KFAC_G_DAMPING_MULT for G) "
                 "(max_dim=0 means no matrix-size cap)"
             )
         if args.kfac_lm_adapt_damping:
@@ -1421,11 +1571,7 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    kfac_lm_enabled = (
-        matrix_optimizer_name == "kfac_muon_expand"
-        and isinstance(optimizer_matrix, KFACMuonExpand)
-        and bool(args.kfac_lm_adapt_damping)
-    )
+    kfac_lm_enabled = using_kfac_muon and isinstance(optimizer_matrix, KFACMuonExpand) and bool(args.kfac_lm_adapt_damping)
     kfac_lm_updates = 0
     kfac_lm_rho_sum = 0.0
     kfac_lm_rho_count = 0
@@ -1562,7 +1708,7 @@ def main() -> None:
         if should_log_train:
             lm_suffix = ""
             eig_suffix = ""
-            if matrix_optimizer_name == "kfac_muon_expand" and isinstance(optimizer_matrix, KFACMuonExpand):
+            if using_kfac_muon and isinstance(optimizer_matrix, KFACMuonExpand):
                 lm_suffix = f" kfac_damping:{optimizer_matrix.get_damping():.6g}"
                 if kfac_lm_updates > 0:
                     rho_avg_total = (
@@ -1590,10 +1736,12 @@ def main() -> None:
                     if should_compute_eig_debug:
                         eig_stats = optimizer_matrix.get_eig_above_damping_stats(max_dim=args.kfac_debug_eig_max_dim)
                         eig_suffix = (
-                            f" kfac_eig_gt_damp_all:{eig_stats['frac_all']:.4f}"
-                            f" kfac_eig_gt_damp_A:{eig_stats['frac_A']:.4f}"
-                            f" kfac_eig_gt_damp_G:{eig_stats['frac_G']:.4f}"
-                            f" kfac_eig_gt_damp_meanmat:{eig_stats['frac_mean_matrix']:.4f}"
+                            f" kfac_eig_gt_damp_raw_all:{eig_stats['frac_all']:.4f}"
+                            f" kfac_eig_gt_damp_eff_all:{eig_stats['frac_all_eff']:.4f}"
+                            f" kfac_eig_gt_damp_eff_A:{eig_stats['frac_A_eff']:.4f}"
+                            f" kfac_eig_gt_damp_eff_G:{eig_stats['frac_G_eff']:.4f}"
+                            f" kfac_eff_damp_A_mean:{eig_stats['eff_damp_A_mean']:.6g}"
+                            f" kfac_eff_damp_G_mean:{eig_stats['eff_damp_G_mean']:.6g}"
                             f" kfac_eig_mats_used:{int(eig_stats['mats_used'])}"
                             f" kfac_eig_mats_skipped:{int(eig_stats['mats_skipped'])}"
                         )
