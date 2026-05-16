@@ -271,6 +271,8 @@ group.add_argument('--kfac-muon-lr-adjustment', type=str, default='none',
                    help='Muon LR adjustment mode inside KFAC for --opt kfac_muon (default: none)')
 group.add_argument('--kfac-max-step-norm', type=float, default=None,
                    help='Optional global norm cap for KFAC steps for --opt kfac_muon')
+group.add_argument('--kfac-use-inverse-factors', action='store_true', default=False,
+                   help='Cache inverse Cholesky factors and use matmuls instead of triangular solves in KFAC steps.')
 group.add_argument('--kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_true',
                    help='Exclude first and last affine layers from KFAC-Muon set (default: enabled)')
 group.add_argument('--no-kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_false',
@@ -697,6 +699,7 @@ class _KFACConfig:
     lr_adjustment: str = 'none'
     weight_decay: float = 0.0
     max_step_norm: Optional[float] = None
+    use_inverse_factors: bool = False
 
 
 class _KFACReduce:
@@ -756,6 +759,22 @@ class _KFACReduce:
             self.factors[module] = {'LA': la, 'LG': lg}
             self.eye_a[module] = ia
             self.eye_g[module] = ig
+            self._refresh_inverse_factors(module)
+
+    def _refresh_inverse_factors(self, module: nn.Module) -> None:
+        if not self.cfg.use_inverse_factors:
+            return
+        factors = self.factors[module]
+        factors['LA_inv'] = torch.linalg.solve_triangular(
+            factors['LA'],
+            self.eye_a[module],
+            upper=False,
+        )
+        factors['LG_inv'] = torch.linalg.solve_triangular(
+            factors['LG'],
+            self.eye_g[module],
+            upper=False,
+        )
 
     def _register_hooks(self) -> None:
         self._hooks = []
@@ -904,6 +923,7 @@ class _KFACReduce:
                 g = self.stats[module]['G'] + g_damp * self.eye_g[module]
                 self.factors[module]['LA'].copy_(self._safe_cholesky(a))
                 self.factors[module]['LG'].copy_(self._safe_cholesky(g))
+                self._refresh_inverse_factors(module)
 
         for module in self.modules:
             self._cache[module]['g'] = None
@@ -935,23 +955,37 @@ class _KFACReduce:
             p_batch = []
             la_batch = []
             lg_batch = []
+            la_inv_batch = []
+            lg_inv_batch = []
             meta_modules = []
             for module, update_2d in modules:
                 p_batch.append(update_2d)
-                la_batch.append(self.factors[module]['LA'])
-                lg_batch.append(self.factors[module]['LG'])
+                if self.cfg.use_inverse_factors:
+                    la_inv_batch.append(self.factors[module]['LA_inv'])
+                    lg_inv_batch.append(self.factors[module]['LG_inv'])
+                else:
+                    la_batch.append(self.factors[module]['LA'])
+                    lg_batch.append(self.factors[module]['LG'])
                 meta_modules.append(module)
 
             p_batch = torch.stack(p_batch, dim=0).contiguous()
-            la_batch = torch.stack(la_batch, dim=0).contiguous()
-            lg_batch = torch.stack(lg_batch, dim=0).contiguous()
+            if self.cfg.use_inverse_factors:
+                la_inv_batch = torch.stack(la_inv_batch, dim=0).contiguous()
+                lg_inv_batch = torch.stack(lg_inv_batch, dim=0).contiguous()
+            else:
+                la_batch = torch.stack(la_batch, dim=0).contiguous()
+                lg_batch = torch.stack(lg_batch, dim=0).contiguous()
             if self._profile_enabled:
                 t_pack_total += time.perf_counter() - pack_start
 
             if self._profile_enabled:
                 solve_in_start = time.perf_counter()
-            tmp = torch.linalg.solve_triangular(lg_batch, p_batch, upper=False)
-            p_hat = torch.linalg.solve_triangular(la_batch, tmp.transpose(-2, -1), upper=False).transpose(-2, -1)
+            if self.cfg.use_inverse_factors:
+                tmp = torch.bmm(lg_inv_batch, p_batch)
+                p_hat = torch.bmm(tmp, la_inv_batch.transpose(-2, -1))
+            else:
+                tmp = torch.linalg.solve_triangular(lg_batch, p_batch, upper=False)
+                p_hat = torch.linalg.solve_triangular(la_batch, tmp.transpose(-2, -1), upper=False).transpose(-2, -1)
             if self._profile_enabled:
                 t_precond_in_total += time.perf_counter() - solve_in_start
 
@@ -969,12 +1003,16 @@ class _KFACReduce:
 
             if self._profile_enabled:
                 solve_out_start = time.perf_counter()
-            tmp2 = torch.linalg.solve_triangular(lg_batch.transpose(-2, -1), x_hat, upper=True)
-            x_batch = torch.linalg.solve_triangular(
-                la_batch.transpose(-2, -1),
-                tmp2.transpose(-2, -1),
-                upper=True,
-            ).transpose(-2, -1)
+            if self.cfg.use_inverse_factors:
+                tmp2 = torch.bmm(lg_inv_batch.transpose(-2, -1), x_hat)
+                x_batch = torch.bmm(tmp2, la_inv_batch)
+            else:
+                tmp2 = torch.linalg.solve_triangular(lg_batch.transpose(-2, -1), x_hat, upper=True)
+                x_batch = torch.linalg.solve_triangular(
+                    la_batch.transpose(-2, -1),
+                    tmp2.transpose(-2, -1),
+                    upper=True,
+                ).transpose(-2, -1)
             if self._profile_enabled:
                 t_precond_out_total += time.perf_counter() - solve_out_start
 
@@ -1188,6 +1226,7 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
                         device=module.weight.device,
                         dtype=torch.float32,
                     )
+            self._kfac._refresh_inverse_factors(module)
 
     def load_state_dict(self, state_dict):
         kfac_state = state_dict.pop('kfac_reduce_state', None)
@@ -1365,6 +1404,7 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         lr_adjustment=args.kfac_muon_lr_adjustment,
         weight_decay=args.weight_decay,
         max_step_norm=args.kfac_max_step_norm,
+        use_inverse_factors=args.kfac_use_inverse_factors,
     )
     return KFACMuonOptimizer(
         model=model,
@@ -2345,6 +2385,10 @@ def main():
                 'KFAC pi balancing: scale=%s trim_fraction=%g',
                 args.kfac_pi_scale,
                 args.kfac_pi_trim_fraction,
+            )
+            _logger.info(
+                'KFAC inverse factors: %s',
+                'enabled' if args.kfac_use_inverse_factors else 'disabled',
             )
 
     results = []
