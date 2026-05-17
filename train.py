@@ -474,6 +474,11 @@ group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
 group.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
                    help='number of checkpoints to keep (default: 10)')
+group.add_argument('--checkpoint-final-only', dest='checkpoint_final_only', action='store_true',
+                   help='Write model checkpoints only at the final epoch while preserving normal validation and summary logging cadence. (default: enabled)')
+group.add_argument('--no-checkpoint-final-only', dest='checkpoint_final_only', action='store_false',
+                   help='Write checkpoints at normal validation cadence instead of final epoch only.')
+group.set_defaults(checkpoint_final_only=True)
 group.add_argument('-j', '--workers', type=int, default=4, metavar='N',
                    help='how many training processes to use (default: 4)')
 group.add_argument('--save-images', action='store_true', default=False,
@@ -2281,6 +2286,7 @@ def main():
     decreasing_metric = eval_metric == 'loss'
     best_metric = None
     best_epoch = None
+    summary_header_written = False
     saver = None
     output_dir = None
     if utils.is_primary(args):
@@ -2489,18 +2495,29 @@ def main():
                     eval_metrics,
                     filename=os.path.join(output_dir, 'summary.csv'),
                     lr=sum(lrs) / len(lrs),
-                    write_header=best_metric is None,
+                    write_header=not summary_header_written,
                     log_wandb=args.log_wandb and has_wandb,
                 )
+                summary_header_written = True
 
             if eval_metrics is not None:
                 latest_metric = eval_metrics[eval_metric]
             else:
                 latest_metric = train_metrics[eval_metric]
 
-            if saver is not None:
-                # save proper checkpoint with eval metric
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=latest_metric)
+            metric_improved = (
+                    best_metric is None
+                    or (latest_metric < best_metric if decreasing_metric else latest_metric > best_metric)
+            )
+            if metric_improved:
+                best_metric = latest_metric
+                best_epoch = epoch
+
+            should_save_checkpoint = (not args.checkpoint_final_only) or (epoch_p_1 == num_epochs)
+            if saver is not None and should_save_checkpoint:
+                # Save checkpoint with eval metric; when --checkpoint-final-only is enabled
+                # this runs only for the final epoch.
+                saver.save_checkpoint(epoch, metric=latest_metric)
 
             if lr_scheduler is not None:
                 # step LR for next epoch
@@ -2524,7 +2541,7 @@ def main():
         torch.distributed.destroy_process_group()
 
     if best_metric is not None:
-        # log best metric as tracked by checkpoint saver
+        # log best metric tracked during validation loop
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
     if utils.is_primary(args):
