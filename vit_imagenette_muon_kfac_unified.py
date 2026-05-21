@@ -774,6 +774,7 @@ class KFACReduce:
         self.eye_A: dict[nn.Module, torch.Tensor] = {}
         self.eye_G: dict[nn.Module, torch.Tensor] = {}
         self.state: dict[nn.Module, dict[str, torch.Tensor]] = {m: {} for m in self.modules}
+        self._stats_initialized: dict[nn.Module, bool] = {m: False for m in self.modules}
         self._init_buffers()
         self._register_hooks()
 
@@ -902,28 +903,45 @@ class KFACReduce:
     def maybe_update_stats(self) -> None:
         self._step += 1
 
-        update_stats = (self.cfg.stats_update_every > 0 and self._step % self.cfg.stats_update_every == 0)
-        update_factors = (self.cfg.factor_update_every > 0 and self._step % self.cfg.factor_update_every == 0)
+        update_stats_interval = (self.cfg.stats_update_every > 0 and self._step % self.cfg.stats_update_every == 0)
+        update_factors_interval = (self.cfg.factor_update_every > 0 and self._step % self.cfg.factor_update_every == 0)
+        stats_changed = False
 
-        if update_stats:
-            gamma = self.cfg.ema_decay
-            one_minus = 1.0 - gamma
-            for m in self.modules:
-                a = self._cache[m].get("a", None)
-                g = self._cache[m].get("g", None)
-                if a is None or g is None or m.weight.grad is None:
-                    continue
-                if isinstance(m, nn.Linear):
-                    A_b, G_b = self._linear_reduce_factors(a, g)
-                elif isinstance(m, nn.Conv2d):
-                    A_b, G_b = self._conv2d_reduce_factors(m, a, g)
-                else:
-                    raise TypeError(f"Unsupported module type: {type(m)}")
+        gamma = self.cfg.ema_decay
+        one_minus = 1.0 - gamma
+        for m in self.modules:
+            a = self._cache[m].get("a", None)
+            g = self._cache[m].get("g", None)
+            if a is None or g is None or m.weight.grad is None:
+                continue
+
+            needs_bootstrap = not self._stats_initialized[m]
+            if not update_stats_interval and not needs_bootstrap:
+                continue
+
+            if isinstance(m, nn.Linear):
+                A_b, G_b = self._linear_reduce_factors(a, g)
+            elif isinstance(m, nn.Conv2d):
+                A_b, G_b = self._conv2d_reduce_factors(m, a, g)
+            else:
+                raise TypeError(f"Unsupported module type: {type(m)}")
+
+            if needs_bootstrap:
+                # First observed stats for this module should come from real data,
+                # not an EMA blend with identity initialization.
+                self.stats[m]["A"].copy_(A_b)
+                self.stats[m]["G"].copy_(G_b)
+                self._stats_initialized[m] = True
+            else:
                 self.stats[m]["A"].mul_(gamma).add_(A_b, alpha=one_minus)
                 self.stats[m]["G"].mul_(gamma).add_(G_b, alpha=one_minus)
+            stats_changed = True
 
-        if update_factors:
+        force_factor_refresh = (self._step == 1)
+        if update_factors_interval or stats_changed or force_factor_refresh:
             for m in self.modules:
+                if not self._stats_initialized[m]:
+                    continue
                 a_damp, g_damp = self._balanced_factor_damping(m)
                 A = self.stats[m]["A"] + a_damp * self.eye_A[m]
                 G = self.stats[m]["G"] + g_damp * self.eye_G[m]

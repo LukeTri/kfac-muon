@@ -719,6 +719,7 @@ class _KFACReduce:
         self.eye_a = {}
         self.eye_g = {}
         self.state = {module: {} for module in self.modules}
+        self._stats_initialized = {module: False for module in self.modules}
         self._profile_enabled = False
         self._profile_totals: Optional[dict] = None
         self._init_buffers()
@@ -901,28 +902,45 @@ class _KFACReduce:
     @torch.no_grad()
     def maybe_update_stats(self) -> None:
         self._step += 1
-        update_stats = self.cfg.stats_update_every > 0 and (self._step % self.cfg.stats_update_every == 0)
-        update_factors = self.cfg.factor_update_every > 0 and (self._step % self.cfg.factor_update_every == 0)
+        update_stats_interval = self.cfg.stats_update_every > 0 and (self._step % self.cfg.stats_update_every == 0)
+        update_factors_interval = self.cfg.factor_update_every > 0 and (self._step % self.cfg.factor_update_every == 0)
+        stats_changed = False
 
-        if update_stats:
-            gamma = self.cfg.ema_decay
-            one_minus = 1.0 - gamma
-            for module in self.modules:
-                activations = self._cache[module].get('a', None)
-                grads = self._cache[module].get('g', None)
-                if activations is None or grads is None or module.weight.grad is None:
-                    continue
-                if isinstance(module, nn.Linear):
-                    a_batch, g_batch = self._linear_reduce_factors(activations, grads)
-                elif isinstance(module, nn.Conv2d):
-                    a_batch, g_batch = self._conv2d_reduce_factors(module, activations, grads)
-                else:
-                    raise TypeError(f'Unsupported module type: {type(module)}')
+        gamma = self.cfg.ema_decay
+        one_minus = 1.0 - gamma
+        for module in self.modules:
+            activations = self._cache[module].get('a', None)
+            grads = self._cache[module].get('g', None)
+            if activations is None or grads is None or module.weight.grad is None:
+                continue
+
+            needs_bootstrap = not self._stats_initialized[module]
+            if not update_stats_interval and not needs_bootstrap:
+                continue
+
+            if isinstance(module, nn.Linear):
+                a_batch, g_batch = self._linear_reduce_factors(activations, grads)
+            elif isinstance(module, nn.Conv2d):
+                a_batch, g_batch = self._conv2d_reduce_factors(module, activations, grads)
+            else:
+                raise TypeError(f'Unsupported module type: {type(module)}')
+
+            if needs_bootstrap:
+                # First real observation for this module: initialize directly from data
+                # instead of blending with the identity prior.
+                self.stats[module]['A'].copy_(a_batch)
+                self.stats[module]['G'].copy_(g_batch)
+                self._stats_initialized[module] = True
+            else:
                 self.stats[module]['A'].mul_(gamma).add_(a_batch, alpha=one_minus)
                 self.stats[module]['G'].mul_(gamma).add_(g_batch, alpha=one_minus)
+            stats_changed = True
 
-        if update_factors:
+        force_factor_refresh = self._step == 1
+        if update_factors_interval or stats_changed or force_factor_refresh:
             for module in self.modules:
+                if not self._stats_initialized[module]:
+                    continue
                 a_damp, g_damp = self._balanced_factor_damping(module)
                 a = self.stats[module]['A'] + a_damp * self.eye_a[module]
                 g = self.stats[module]['G'] + g_damp * self.eye_g[module]
@@ -1129,6 +1147,12 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
         self._kfac_step_calls = 0
         self._last_kfac_grad_step_dot = 0.0
         self._last_kfac_model_delta = 0.0
+        self._last_kfac_grad_norm = 0.0
+        self._last_kfac_step_norm = 0.0
+        self._last_kfac_grad_rms = 0.0
+        self._last_kfac_step_rms = 0.0
+        self._last_kfac_effective_step_ratio = 0.0
+        self._last_kfac_grad_step_cos = 0.0
 
     def close(self) -> None:
         self._kfac.close()
@@ -1144,6 +1168,24 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
 
     def get_last_kfac_model_delta(self) -> float:
         return float(self._last_kfac_model_delta)
+
+    def get_last_kfac_grad_norm(self) -> float:
+        return float(self._last_kfac_grad_norm)
+
+    def get_last_kfac_step_norm(self) -> float:
+        return float(self._last_kfac_step_norm)
+
+    def get_last_kfac_grad_rms(self) -> float:
+        return float(self._last_kfac_grad_rms)
+
+    def get_last_kfac_step_rms(self) -> float:
+        return float(self._last_kfac_step_rms)
+
+    def get_last_kfac_effective_step_ratio(self) -> float:
+        return float(self._last_kfac_effective_step_ratio)
+
+    def get_last_kfac_grad_step_cos(self) -> float:
+        return float(self._last_kfac_grad_step_cos)
 
     def get_kfac_step_calls(self) -> int:
         return int(self._kfac_step_calls)
@@ -1174,6 +1216,7 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
                 'G': self._kfac.stats[module]['G'].detach().clone(),
                 'LA': self._kfac.factors[module]['LA'].detach().clone(),
                 'LG': self._kfac.factors[module]['LG'].detach().clone(),
+                'stats_initialized': bool(self._kfac._stats_initialized.get(module, False)),
             }
             momentum_buffer = self._kfac.state[module].get('momentum_buffer', None)
             if momentum_buffer is not None:
@@ -1231,6 +1274,7 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
                         device=module.weight.device,
                         dtype=torch.float32,
                     )
+            self._kfac._stats_initialized[module] = bool(saved.get('stats_initialized', True))
             self._kfac._refresh_inverse_factors(module)
 
     def load_state_dict(self, state_dict):
@@ -1268,13 +1312,34 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
         if self._profile_enabled:
             self._profile_totals['kfac_compute_steps_s'] += time.perf_counter() - t1
         grad_step_dot = 0.0
+        grad_sq_norm = 0.0
+        step_sq_norm = 0.0
+        grad_numel = 0
         for param, step, _, step_lr in kfac_steps:
             if param.grad is None:
                 continue
-            grad_step_dot += float((param.grad.float() * step.float() * float(step_lr)).sum().item())
+            grad = param.grad.float()
+            delta = step.float() * float(step_lr)
+            grad_step_dot += float((grad * delta).sum().item())
+            grad_sq_norm += float(grad.square().sum().item())
+            step_sq_norm += float(delta.square().sum().item())
+            grad_numel += int(grad.numel())
         self._last_kfac_grad_step_dot = grad_step_dot
         # Chapter-6 LM uses M(delta)-M(0)=0.5 * grad^T delta (for the chosen delta).
         self._last_kfac_model_delta = 0.5 * grad_step_dot
+        grad_norm = math.sqrt(max(grad_sq_norm, 0.0))
+        step_norm = math.sqrt(max(step_sq_norm, 0.0))
+        self._last_kfac_grad_norm = grad_norm
+        self._last_kfac_step_norm = step_norm
+        if grad_numel > 0:
+            denom = math.sqrt(float(grad_numel))
+            self._last_kfac_grad_rms = grad_norm / denom
+            self._last_kfac_step_rms = step_norm / denom
+        else:
+            self._last_kfac_grad_rms = 0.0
+            self._last_kfac_step_rms = 0.0
+        self._last_kfac_effective_step_ratio = step_norm / max(grad_norm, 1e-12)
+        self._last_kfac_grad_step_cos = grad_step_dot / max(grad_norm * step_norm, 1e-12)
 
         aux_start = time.perf_counter() if self._profile_enabled else None
         for group in self.param_groups:
@@ -2588,13 +2653,21 @@ def train_one_epoch(
     profile_sync = profile_enabled and bool(getattr(args, 'profile_runtime_sync', False))
     profile_stats = defaultdict(float)
     profile_counts = defaultdict(int)
-    kfac_lm_enabled = isinstance(optimizer, KFACMuonOptimizer) and bool(getattr(args, 'kfac_lm_adapt_damping', False))
+    is_kfac_optimizer = isinstance(optimizer, KFACMuonOptimizer)
+    kfac_lm_enabled = is_kfac_optimizer and bool(getattr(args, 'kfac_lm_adapt_damping', False))
     kfac_lm_log_every = int(args.log_interval if args.kfac_lm_log_every is None else args.kfac_lm_log_every)
     kfac_lm_replay_batches = []
     kfac_lm_pre_loss_sum = 0.0
     kfac_lm_pre_loss_weight = 0.0
     kfac_lm_update_count = 0
     kfac_lm_rho_sum = 0.0
+    kfac_step_events = 0
+    kfac_effective_ratio_m = utils.AverageMeter()
+    kfac_step_norm_m = utils.AverageMeter()
+    kfac_grad_norm_m = utils.AverageMeter()
+    kfac_step_rms_m = utils.AverageMeter()
+    kfac_grad_rms_m = utils.AverageMeter()
+    kfac_grad_step_cos_m = utils.AverageMeter()
 
     def _clone_batch_for_replay(obj):
         if torch.is_tensor(obj):
@@ -2648,7 +2721,7 @@ def train_one_epoch(
         )
         kfac_step_calls_before = (
             optimizer.get_kfac_step_calls()
-            if use_kfac_lm_this_update and need_update
+            if is_kfac_optimizer and need_update
             else None
         )
 
@@ -2798,12 +2871,22 @@ def train_one_epoch(
             data_start_time = time.time()
             continue
 
+        kfac_step_executed = (
+            is_kfac_optimizer
+            and kfac_step_calls_before is not None
+            and optimizer.get_kfac_step_calls() > kfac_step_calls_before
+        )
+        if kfac_step_executed:
+            kfac_step_events += 1
+            kfac_effective_ratio_m.update(optimizer.get_last_kfac_effective_step_ratio())
+            kfac_step_norm_m.update(optimizer.get_last_kfac_step_norm())
+            kfac_grad_norm_m.update(optimizer.get_last_kfac_grad_norm())
+            kfac_step_rms_m.update(optimizer.get_last_kfac_step_rms())
+            kfac_grad_rms_m.update(optimizer.get_last_kfac_grad_rms())
+            kfac_grad_step_cos_m.update(optimizer.get_last_kfac_grad_step_cos())
+
         if use_kfac_lm_this_update:
-            step_executed = (
-                kfac_step_calls_before is not None
-                and optimizer.get_kfac_step_calls() > kfac_step_calls_before
-            )
-            if step_executed and kfac_lm_pre_loss_weight > 0.0 and kfac_lm_replay_batches:
+            if kfac_step_executed and kfac_lm_pre_loss_weight > 0.0 and kfac_lm_replay_batches:
                 pre_loss_local = kfac_lm_pre_loss_sum / max(kfac_lm_pre_loss_weight, 1e-12)
                 post_loss_sum = 0.0
                 post_loss_weight = 0.0
@@ -2903,6 +2986,13 @@ def train_one_epoch(
                 loss_avg = utils.reduce_tensor(loss.new([loss_avg]), args.world_size).item()
                 loss_now = utils.reduce_tensor(loss.new([loss_now]), args.world_size).item()
 
+            kfac_diag = ''
+            if is_kfac_optimizer and kfac_step_events > 0:
+                kfac_diag = (
+                    f'  KFAC |delta|/|g|: {kfac_effective_ratio_m.val:.3e} ({kfac_effective_ratio_m.avg:.3e})  '
+                    f'|delta|_rms: {kfac_step_rms_m.val:.3e} ({kfac_step_rms_m.avg:.3e})'
+                )
+
             if utils.is_primary(args):
                 _logger.info(
                     f'Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
@@ -2912,6 +3002,7 @@ def train_one_epoch(
                     f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  '
                     f'LR: {lr:.3e}  '
                     f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})'
+                    f'{kfac_diag}'
                 )
 
                 if args.save_images and output_dir:
@@ -2978,6 +3069,21 @@ def train_one_epoch(
         loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
         loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
     metrics = OrderedDict([('loss', loss_avg)])
+    if is_kfac_optimizer:
+        if kfac_step_events > 0:
+            metrics['kfac_eff_step_ratio'] = float(kfac_effective_ratio_m.avg)
+            metrics['kfac_step_norm'] = float(kfac_step_norm_m.avg)
+            metrics['kfac_grad_norm'] = float(kfac_grad_norm_m.avg)
+            metrics['kfac_step_rms'] = float(kfac_step_rms_m.avg)
+            metrics['kfac_grad_rms'] = float(kfac_grad_rms_m.avg)
+            metrics['kfac_grad_step_cos'] = float(kfac_grad_step_cos_m.avg)
+        else:
+            metrics['kfac_eff_step_ratio'] = float('nan')
+            metrics['kfac_step_norm'] = float('nan')
+            metrics['kfac_grad_norm'] = float('nan')
+            metrics['kfac_step_rms'] = float('nan')
+            metrics['kfac_grad_rms'] = float('nan')
+            metrics['kfac_grad_step_cos'] = float('nan')
     if kfac_lm_update_count > 0:
         metrics['kfac_lm_updates'] = float(kfac_lm_update_count)
         metrics['kfac_lm_rho_avg'] = float(kfac_lm_rho_sum / max(kfac_lm_update_count, 1))
