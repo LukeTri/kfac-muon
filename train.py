@@ -1015,9 +1015,10 @@ class _KFACReduce:
                 la_batch = torch.stack(la_batch, dim=0).contiguous()
                 lg_batch = torch.stack(lg_batch, dim=0).contiguous()
 
-            # Reference Muon step computed from the same momentum-filtered update
-            # but without KFAC preconditioning (still using the same NS + muon_eps + lr adjustment).
-            muon_ref_batch = -float(self.cfg.muon_eps) * _muon_quintic_ns(
+            # Reference plain-Muon step computed from the same momentum-filtered update
+            # but without KFAC preconditioning. Intentionally independent of kfac_muon_eps
+            # so this matches a baseline "Muon at setup LR" comparison.
+            muon_ref_batch = -_muon_quintic_ns(
                 p_batch,
                 ns_steps=self.cfg.muon_ns_steps,
                 ns_coefficients=self.cfg.muon_ns_coefficients,
