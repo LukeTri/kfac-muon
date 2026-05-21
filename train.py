@@ -218,10 +218,15 @@ group.add_argument('--kfac-pi-scale', type=str, default='trace',
 group.add_argument('--kfac-pi-trim-fraction', type=float, default=0.1,
                    help='Trim fraction in [0, 0.5) for --kfac-pi-scale=diag_trimmed_mean (default: 0.1)')
 group.add_argument('--kfac-damping-schedule', type=str, default='none',
-                   choices=['none', 'linear', 'cosine'],
+                   choices=['none', 'linear', 'cosine', 'cosine_bump'],
                    help='Optional epoch-wise schedule for KFAC damping in --opt kfac_muon (default: none)')
 group.add_argument('--kfac-damping-final', type=float, default=None,
                    help='Final KFAC damping for --opt kfac_muon schedule (default: same as --kfac-damping)')
+group.add_argument('--kfac-damping-peak', type=float, default=None,
+                   help='Peak KFAC damping for --kfac-damping-schedule=cosine_bump (required for cosine_bump)')
+group.add_argument('--kfac-damping-peak-fraction', type=float, default=0.5,
+                   help='Peak position fraction in (0, 1) within [start_epoch, end_epoch] for cosine_bump '
+                        '(default: 0.5)')
 group.add_argument('--kfac-damping-start-epoch', type=int, default=0,
                    help='Start epoch (inclusive) for KFAC damping schedule in --opt kfac_muon (default: 0)')
 group.add_argument('--kfac-damping-end-epoch', type=int, default=None,
@@ -1509,6 +1514,16 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         )
     if args.kfac_damping_final is not None and args.kfac_damping_final < 0.0:
         raise ValueError(f'--kfac-damping-final must be >= 0 for kfac_muon, got {args.kfac_damping_final}')
+    if args.kfac_damping_peak is not None and args.kfac_damping_peak < 0.0:
+        raise ValueError(f'--kfac-damping-peak must be >= 0 for kfac_muon, got {args.kfac_damping_peak}')
+    if not 0.0 < args.kfac_damping_peak_fraction < 1.0:
+        raise ValueError(
+            f'--kfac-damping-peak-fraction must be in (0, 1) for kfac_muon, got {args.kfac_damping_peak_fraction}'
+        )
+    if args.kfac_damping_schedule == 'cosine_bump' and args.kfac_damping_peak is None:
+        raise ValueError(
+            '--kfac-damping-peak is required when --kfac-damping-schedule=cosine_bump for kfac_muon.'
+        )
     if args.kfac_damping_start_epoch < 0:
         raise ValueError(
             f'--kfac-damping-start-epoch must be >= 0 for kfac_muon, got {args.kfac_damping_start_epoch}'
@@ -1596,6 +1611,17 @@ def _kfac_damping_for_epoch(args, epoch: int, num_epochs: int) -> float:
         alpha = progress
     elif mode == 'cosine':
         alpha = 0.5 * (1.0 - math.cos(math.pi * progress))
+    elif mode == 'cosine_bump':
+        peak = float(args.kfac_damping_peak)
+        peak_fraction = float(args.kfac_damping_peak_fraction)
+        peak_pos = start + (end - start) * peak_fraction
+        if epoch <= peak_pos:
+            rise = (epoch - start) / max(peak_pos - start, 1e-12)
+            rise_alpha = 0.5 * (1.0 - math.cos(math.pi * rise))
+            return base + (peak - base) * rise_alpha
+        fall = (epoch - peak_pos) / max(end - peak_pos, 1e-12)
+        fall_alpha = 0.5 * (1.0 - math.cos(math.pi * fall))
+        return peak + (final - peak) * fall_alpha
     else:
         raise ValueError(f'Unknown KFAC damping schedule mode: {mode}')
 
@@ -2504,14 +2530,26 @@ def main():
             else:
                 end_epoch = num_epochs - 1 if args.kfac_damping_end_epoch is None else args.kfac_damping_end_epoch
                 final_damping = args.kfac_damping if args.kfac_damping_final is None else args.kfac_damping_final
-                _logger.info(
-                    'KFAC damping schedule: mode=%s base=%g final=%g start_epoch=%d end_epoch=%s',
-                    args.kfac_damping_schedule,
-                    args.kfac_damping,
-                    final_damping,
-                    args.kfac_damping_start_epoch,
-                    end_epoch,
-                )
+                if args.kfac_damping_schedule == 'cosine_bump':
+                    _logger.info(
+                        'KFAC damping schedule: mode=%s base=%g peak=%g final=%g peak_frac=%.3f start_epoch=%d end_epoch=%s',
+                        args.kfac_damping_schedule,
+                        args.kfac_damping,
+                        args.kfac_damping_peak,
+                        final_damping,
+                        args.kfac_damping_peak_fraction,
+                        args.kfac_damping_start_epoch,
+                        end_epoch,
+                    )
+                else:
+                    _logger.info(
+                        'KFAC damping schedule: mode=%s base=%g final=%g start_epoch=%d end_epoch=%s',
+                        args.kfac_damping_schedule,
+                        args.kfac_damping,
+                        final_damping,
+                        args.kfac_damping_start_epoch,
+                        end_epoch,
+                    )
             _logger.info(
                 'KFAC pi balancing: scale=%s trim_fraction=%g',
                 args.kfac_pi_scale,
