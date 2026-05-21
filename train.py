@@ -720,6 +720,11 @@ class _KFACReduce:
         self.eye_g = {}
         self.state = {module: {} for module in self.modules}
         self._stats_initialized = {module: False for module in self.modules}
+        self._last_applied_step_norm = 0.0
+        self._last_applied_step_rms = 0.0
+        self._last_muon_ref_step_norm = 0.0
+        self._last_muon_ref_step_rms = 0.0
+        self._last_step_vs_muon_ref_ratio = 0.0
         self._profile_enabled = False
         self._profile_totals: Optional[dict] = None
         self._init_buffers()
@@ -868,6 +873,15 @@ class _KFACReduce:
         buf.mul_(momentum).add_(grad_2d)
         return grad_2d.add(buf, alpha=momentum) if self.cfg.nesterov else buf
 
+    def get_last_step_vs_muon_ref_ratio(self) -> float:
+        return float(self._last_step_vs_muon_ref_ratio)
+
+    def get_last_muon_ref_step_norm(self) -> float:
+        return float(self._last_muon_ref_step_norm)
+
+    def get_last_muon_ref_step_rms(self) -> float:
+        return float(self._last_muon_ref_step_rms)
+
     def _linear_reduce_factors(self, activations: torch.Tensor, grads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         activations = activations.float().reshape(activations.shape[0], -1, activations.shape[-1])
         grads = grads.float().reshape(grads.shape[0], -1, grads.shape[-1])
@@ -960,6 +974,8 @@ class _KFACReduce:
         t_unpack_total = 0.0
 
         groups = defaultdict(list)
+        muon_ref_sq_norm = 0.0
+        param_numel_total = 0
         pack_start = time.perf_counter() if self._profile_enabled else None
         for module in self.modules:
             if module.weight.grad is None:
@@ -998,6 +1014,15 @@ class _KFACReduce:
             else:
                 la_batch = torch.stack(la_batch, dim=0).contiguous()
                 lg_batch = torch.stack(lg_batch, dim=0).contiguous()
+
+            # Reference Muon step computed from the same momentum-filtered update
+            # but without KFAC preconditioning (still using the same NS + muon_eps + lr adjustment).
+            muon_ref_batch = -float(self.cfg.muon_eps) * _muon_quintic_ns(
+                p_batch,
+                ns_steps=self.cfg.muon_ns_steps,
+                ns_coefficients=self.cfg.muon_ns_coefficients,
+                eps=self.cfg.muon_ns_eps,
+            )
             if self._profile_enabled:
                 t_pack_total += time.perf_counter() - pack_start
 
@@ -1049,6 +1074,9 @@ class _KFACReduce:
                     mode=self.cfg.lr_adjustment,
                 )
                 steps_for_params.append((module.weight, step, lr, step_lr))
+                muon_ref_step = muon_ref_batch[idx].reshape_as(module.weight)
+                muon_ref_sq_norm += float((muon_ref_step.float() * float(step_lr)).square().sum().item())
+                param_numel_total += int(module.weight.numel())
             if self._profile_enabled:
                 t_unpack_total += time.perf_counter() - unpack_start
 
@@ -1062,6 +1090,22 @@ class _KFACReduce:
                 (param, step * scale, wd_lr, step_lr)
                 for param, step, wd_lr, step_lr in steps_for_params
             ]
+
+        applied_sq_norm = 0.0
+        for _, step, _, step_lr in steps_for_params:
+            applied_sq_norm += float((step.float() * float(step_lr)).square().sum().item())
+        applied_step_norm = math.sqrt(max(applied_sq_norm, 0.0))
+        muon_ref_step_norm = math.sqrt(max(muon_ref_sq_norm, 0.0))
+        self._last_applied_step_norm = applied_step_norm
+        self._last_muon_ref_step_norm = muon_ref_step_norm
+        self._last_step_vs_muon_ref_ratio = applied_step_norm / max(muon_ref_step_norm, 1e-12)
+        if param_numel_total > 0:
+            denom = math.sqrt(float(param_numel_total))
+            self._last_applied_step_rms = applied_step_norm / denom
+            self._last_muon_ref_step_rms = muon_ref_step_norm / denom
+        else:
+            self._last_applied_step_rms = 0.0
+            self._last_muon_ref_step_rms = 0.0
 
         if self._profile_enabled:
             self._prof_add('kfac_solve_pack_s', t_pack_total)
@@ -1153,6 +1197,9 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
         self._last_kfac_step_rms = 0.0
         self._last_kfac_effective_step_ratio = 0.0
         self._last_kfac_grad_step_cos = 0.0
+        self._last_kfac_muon_ref_step_norm = 0.0
+        self._last_kfac_muon_ref_step_rms = 0.0
+        self._last_kfac_vs_muon_step_ratio = 0.0
 
     def close(self) -> None:
         self._kfac.close()
@@ -1186,6 +1233,15 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
 
     def get_last_kfac_grad_step_cos(self) -> float:
         return float(self._last_kfac_grad_step_cos)
+
+    def get_last_kfac_muon_ref_step_norm(self) -> float:
+        return float(self._last_kfac_muon_ref_step_norm)
+
+    def get_last_kfac_muon_ref_step_rms(self) -> float:
+        return float(self._last_kfac_muon_ref_step_rms)
+
+    def get_last_kfac_vs_muon_step_ratio(self) -> float:
+        return float(self._last_kfac_vs_muon_step_ratio)
 
     def get_kfac_step_calls(self) -> int:
         return int(self._kfac_step_calls)
@@ -1340,6 +1396,9 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
             self._last_kfac_step_rms = 0.0
         self._last_kfac_effective_step_ratio = step_norm / max(grad_norm, 1e-12)
         self._last_kfac_grad_step_cos = grad_step_dot / max(grad_norm * step_norm, 1e-12)
+        self._last_kfac_muon_ref_step_norm = self._kfac.get_last_muon_ref_step_norm()
+        self._last_kfac_muon_ref_step_rms = self._kfac.get_last_muon_ref_step_rms()
+        self._last_kfac_vs_muon_step_ratio = self._kfac.get_last_step_vs_muon_ref_ratio()
 
         aux_start = time.perf_counter() if self._profile_enabled else None
         for group in self.param_groups:
@@ -2668,6 +2727,9 @@ def train_one_epoch(
     kfac_step_rms_m = utils.AverageMeter()
     kfac_grad_rms_m = utils.AverageMeter()
     kfac_grad_step_cos_m = utils.AverageMeter()
+    kfac_vs_muon_step_ratio_m = utils.AverageMeter()
+    kfac_muon_ref_step_norm_m = utils.AverageMeter()
+    kfac_muon_ref_step_rms_m = utils.AverageMeter()
 
     def _clone_batch_for_replay(obj):
         if torch.is_tensor(obj):
@@ -2884,6 +2946,9 @@ def train_one_epoch(
             kfac_step_rms_m.update(optimizer.get_last_kfac_step_rms())
             kfac_grad_rms_m.update(optimizer.get_last_kfac_grad_rms())
             kfac_grad_step_cos_m.update(optimizer.get_last_kfac_grad_step_cos())
+            kfac_vs_muon_step_ratio_m.update(optimizer.get_last_kfac_vs_muon_step_ratio())
+            kfac_muon_ref_step_norm_m.update(optimizer.get_last_kfac_muon_ref_step_norm())
+            kfac_muon_ref_step_rms_m.update(optimizer.get_last_kfac_muon_ref_step_rms())
 
         if use_kfac_lm_this_update:
             if kfac_step_executed and kfac_lm_pre_loss_weight > 0.0 and kfac_lm_replay_batches:
@@ -2990,7 +3055,8 @@ def train_one_epoch(
             if is_kfac_optimizer and kfac_step_events > 0:
                 kfac_diag = (
                     f'  KFAC |delta|/|g|: {kfac_effective_ratio_m.val:.3e} ({kfac_effective_ratio_m.avg:.3e})  '
-                    f'|delta|_rms: {kfac_step_rms_m.val:.3e} ({kfac_step_rms_m.avg:.3e})'
+                    f'|delta|_rms: {kfac_step_rms_m.val:.3e} ({kfac_step_rms_m.avg:.3e})  '
+                    f'|delta|/|delta_muon|: {kfac_vs_muon_step_ratio_m.val:.3e} ({kfac_vs_muon_step_ratio_m.avg:.3e})'
                 )
 
             if utils.is_primary(args):
@@ -3077,6 +3143,9 @@ def train_one_epoch(
             metrics['kfac_step_rms'] = float(kfac_step_rms_m.avg)
             metrics['kfac_grad_rms'] = float(kfac_grad_rms_m.avg)
             metrics['kfac_grad_step_cos'] = float(kfac_grad_step_cos_m.avg)
+            metrics['kfac_vs_muon_step_ratio'] = float(kfac_vs_muon_step_ratio_m.avg)
+            metrics['kfac_muon_ref_step_norm'] = float(kfac_muon_ref_step_norm_m.avg)
+            metrics['kfac_muon_ref_step_rms'] = float(kfac_muon_ref_step_rms_m.avg)
         else:
             metrics['kfac_eff_step_ratio'] = float('nan')
             metrics['kfac_step_norm'] = float('nan')
@@ -3084,6 +3153,9 @@ def train_one_epoch(
             metrics['kfac_step_rms'] = float('nan')
             metrics['kfac_grad_rms'] = float('nan')
             metrics['kfac_grad_step_cos'] = float('nan')
+            metrics['kfac_vs_muon_step_ratio'] = float('nan')
+            metrics['kfac_muon_ref_step_norm'] = float('nan')
+            metrics['kfac_muon_ref_step_rms'] = float('nan')
     if kfac_lm_update_count > 0:
         metrics['kfac_lm_updates'] = float(kfac_lm_update_count)
         metrics['kfac_lm_rho_avg'] = float(kfac_lm_rho_sum / max(kfac_lm_update_count, 1))
