@@ -52,10 +52,10 @@ KFAC_LR_LOW="${KFAC_LR_LOW:-4.5e-4}"
 KFAC_LR_HIGH="${KFAC_LR_HIGH:-7e-4}"
 
 if [[ "$PHASE" == "pilot" ]]; then
-  EPOCHS="${EPOCHS:-80}"
-  BASE_MIXUP_OFF_EPOCH="${BASE_MIXUP_OFF_EPOCH:-60}"
+  EPOCHS="${EPOCHS:-75}"
+  BASE_MIXUP_OFF_EPOCH="${BASE_MIXUP_OFF_EPOCH:-56}"
   DEFAULT_SEEDS="${DEFAULT_SEEDS:-12}"
-  DEFAULT_CASES="muon_fixed,muon_lr_low,muon_lr_high,kfac_vit_base,kfac_lr_low,kfac_lr_high,kfac_lmoff,kfac_rho_wide,kfac_damp_5e5,kfac_damp_2e4,kfac_eps0055,kfac_dp005,kfac_wd005"
+  DEFAULT_CASES="muon_fixed,muon_lr_low,muon_lr_high,kfac_vit_base,kfac_lr_low,kfac_lr_high,kfac_lmoff,kfac_rho_wide,kfac_damp_5e5,kfac_eps0055,kfac_dp005,kfac_wd005"
 elif [[ "$PHASE" == "full" ]]; then
   EPOCHS="${EPOCHS:-200}"
   BASE_MIXUP_OFF_EPOCH="${BASE_MIXUP_OFF_EPOCH:-140}"
