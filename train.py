@@ -278,6 +278,21 @@ group.add_argument('--kfac-max-step-norm', type=float, default=None,
                    help='Optional global norm cap for KFAC steps for --opt kfac_muon')
 group.add_argument('--kfac-use-inverse-factors', action='store_true', default=False,
                    help='Cache inverse Cholesky factors and use matmuls instead of triangular solves in KFAC steps.')
+group.add_argument('--kfac-inverse-compute-dtype', type=str, default='float32',
+                   choices=['float32', 'float16', 'bfloat16'],
+                   help='Compute dtype for inverse-factor matmuls in --opt kfac_muon '
+                        '(only applies with --kfac-use-inverse-factors, default: float32).')
+group.add_argument('--kfac-refresh-factors-on-stats-update', dest='kfac_refresh_factors_on_stats_update',
+                   action='store_true',
+                   help='Refresh KFAC factors immediately whenever running stats are updated '
+                        '(default: disabled, uses --kfac-factor-update-every cadence).')
+group.add_argument('--no-kfac-refresh-factors-on-stats-update', dest='kfac_refresh_factors_on_stats_update',
+                   action='store_false',
+                   help='Do not refresh KFAC factors on every stats update; refresh on factor cadence instead.')
+group.add_argument('--kfac-track-muon-reference', dest='kfac_track_muon_reference', action='store_true',
+                   help='Track plain-Muon reference step metrics in --opt kfac_muon (default: enabled).')
+group.add_argument('--no-kfac-track-muon-reference', dest='kfac_track_muon_reference', action='store_false',
+                   help='Disable plain-Muon reference step metrics in --opt kfac_muon to reduce overhead.')
 group.add_argument('--kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_true',
                    help='Exclude first and last affine layers from KFAC-Muon set (default: enabled)')
 group.add_argument('--no-kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_false',
@@ -310,6 +325,8 @@ parser.set_defaults(
     kfac_nesterov=True,
     kfac_exclude_first_last=True,
     kfac_aux_no_decay=True,
+    kfac_refresh_factors_on_stats_update=False,
+    kfac_track_muon_reference=True,
     kfac_lm_adapt_damping=True,
     fismo_exclude_first_last=True,
     fismo_aux_no_decay=True,
@@ -710,6 +727,9 @@ class _KFACConfig:
     weight_decay: float = 0.0
     max_step_norm: Optional[float] = None
     use_inverse_factors: bool = False
+    inverse_compute_dtype: str = 'float32'
+    refresh_factors_on_stats_update: bool = False
+    track_muon_reference: bool = True
 
 
 class _KFACReduce:
@@ -732,6 +752,9 @@ class _KFACReduce:
         self._last_step_vs_muon_ref_ratio = 0.0
         self._profile_enabled = False
         self._profile_totals: Optional[dict] = None
+        self._last_factor_damping = float(self.cfg.damping)
+        self._factors_dirty = {module: True for module in self.modules}
+        self._warned_inverse_compute_dtype = False
         self._init_buffers()
         self._register_hooks()
 
@@ -742,6 +765,40 @@ class _KFACReduce:
     def _prof_add(self, key: str, dt: float) -> None:
         if self._profile_enabled and self._profile_totals is not None:
             self._profile_totals[key] += float(dt)
+
+    def _resolve_inverse_compute_dtype(self, device: torch.device) -> torch.dtype:
+        mode = str(self.cfg.inverse_compute_dtype).lower()
+        if mode == 'float32':
+            return torch.float32
+        if device.type != 'cuda':
+            if not self._warned_inverse_compute_dtype:
+                _logger.warning(
+                    'Requested --kfac-inverse-compute-dtype=%s on %s; '
+                    'falling back to float32 for inverse-factor matmuls.',
+                    mode,
+                    device.type,
+                )
+                self._warned_inverse_compute_dtype = True
+            return torch.float32
+        if mode == 'float16':
+            return torch.float16
+        if mode == 'bfloat16':
+            if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            if not self._warned_inverse_compute_dtype:
+                _logger.warning(
+                    'Requested --kfac-inverse-compute-dtype=bfloat16 but CUDA bf16 is unavailable; '
+                    'falling back to float32 for inverse-factor matmuls.'
+                )
+                self._warned_inverse_compute_dtype = True
+            return torch.float32
+        if not self._warned_inverse_compute_dtype:
+            _logger.warning(
+                'Unknown --kfac-inverse-compute-dtype=%s; falling back to float32.',
+                mode,
+            )
+            self._warned_inverse_compute_dtype = True
+        return torch.float32
 
     @staticmethod
     def _weight_matrix_shape(module: nn.Module) -> tuple[int, int]:
@@ -924,6 +981,7 @@ class _KFACReduce:
         update_stats_interval = self.cfg.stats_update_every > 0 and (self._step % self.cfg.stats_update_every == 0)
         update_factors_interval = self.cfg.factor_update_every > 0 and (self._step % self.cfg.factor_update_every == 0)
         stats_changed = False
+        bootstrap_changed = False
 
         gamma = self.cfg.ema_decay
         one_minus = 1.0 - gamma
@@ -950,15 +1008,28 @@ class _KFACReduce:
                 self.stats[module]['A'].copy_(a_batch)
                 self.stats[module]['G'].copy_(g_batch)
                 self._stats_initialized[module] = True
+                bootstrap_changed = True
             else:
                 self.stats[module]['A'].mul_(gamma).add_(a_batch, alpha=one_minus)
                 self.stats[module]['G'].mul_(gamma).add_(g_batch, alpha=one_minus)
             stats_changed = True
+            self._factors_dirty[module] = True
 
         force_factor_refresh = self._step == 1
-        if update_factors_interval or stats_changed or force_factor_refresh:
+        damping_now = float(self.cfg.damping)
+        damping_changed = damping_now != self._last_factor_damping
+        refresh_factors = (
+            force_factor_refresh
+            or damping_changed
+            or update_factors_interval
+            or (bool(self.cfg.refresh_factors_on_stats_update) and stats_changed)
+            or bootstrap_changed
+        )
+        if refresh_factors:
             for module in self.modules:
                 if not self._stats_initialized[module]:
+                    continue
+                if not (force_factor_refresh or damping_changed or self._factors_dirty[module]):
                     continue
                 a_damp, g_damp = self._balanced_factor_damping(module)
                 a = self.stats[module]['A'] + a_damp * self.eye_a[module]
@@ -966,6 +1037,8 @@ class _KFACReduce:
                 self.factors[module]['LA'].copy_(self._safe_cholesky(a))
                 self.factors[module]['LG'].copy_(self._safe_cholesky(g))
                 self._refresh_inverse_factors(module)
+                self._factors_dirty[module] = False
+            self._last_factor_damping = damping_now
 
         for module in self.modules:
             self._cache[module]['g'] = None
@@ -979,7 +1052,7 @@ class _KFACReduce:
         t_unpack_total = 0.0
 
         groups = defaultdict(list)
-        muon_ref_sq_norm = 0.0
+        muon_ref_sq_norm_t = None
         param_numel_total = 0
         pack_start = time.perf_counter() if self._profile_enabled else None
         for module in self.modules:
@@ -1016,27 +1089,36 @@ class _KFACReduce:
             if self.cfg.use_inverse_factors:
                 la_inv_batch = torch.stack(la_inv_batch, dim=0).contiguous()
                 lg_inv_batch = torch.stack(lg_inv_batch, dim=0).contiguous()
+                inv_compute_dtype = self._resolve_inverse_compute_dtype(p_batch.device)
+                if la_inv_batch.dtype != inv_compute_dtype:
+                    la_inv_batch = la_inv_batch.to(dtype=inv_compute_dtype)
+                    lg_inv_batch = lg_inv_batch.to(dtype=inv_compute_dtype)
             else:
                 la_batch = torch.stack(la_batch, dim=0).contiguous()
                 lg_batch = torch.stack(lg_batch, dim=0).contiguous()
 
-            # Reference plain-Muon step computed from the same momentum-filtered update
-            # but without KFAC preconditioning. Intentionally independent of kfac_muon_eps
-            # so this matches a baseline "Muon at setup LR" comparison.
-            muon_ref_batch = -_muon_quintic_ns(
-                p_batch,
-                ns_steps=self.cfg.muon_ns_steps,
-                ns_coefficients=self.cfg.muon_ns_coefficients,
-                eps=self.cfg.muon_ns_eps,
-            )
+            muon_ref_batch = None
+            if self.cfg.track_muon_reference:
+                # Reference plain-Muon step computed from the same momentum-filtered update
+                # but without KFAC preconditioning. Intentionally independent of kfac_muon_eps
+                # so this matches a baseline "Muon at setup LR" comparison.
+                muon_ref_batch = -_muon_quintic_ns(
+                    p_batch,
+                    ns_steps=self.cfg.muon_ns_steps,
+                    ns_coefficients=self.cfg.muon_ns_coefficients,
+                    eps=self.cfg.muon_ns_eps,
+                )
             if self._profile_enabled:
                 t_pack_total += time.perf_counter() - pack_start
 
             if self._profile_enabled:
                 solve_in_start = time.perf_counter()
             if self.cfg.use_inverse_factors:
-                tmp = torch.bmm(lg_inv_batch, p_batch)
+                p_batch_in = p_batch if p_batch.dtype == inv_compute_dtype else p_batch.to(dtype=inv_compute_dtype)
+                tmp = torch.bmm(lg_inv_batch, p_batch_in)
                 p_hat = torch.bmm(tmp, la_inv_batch.transpose(-2, -1))
+                if p_hat.dtype != torch.float32:
+                    p_hat = p_hat.float()
             else:
                 tmp = torch.linalg.solve_triangular(lg_batch, p_batch, upper=False)
                 p_hat = torch.linalg.solve_triangular(la_batch, tmp.transpose(-2, -1), upper=False).transpose(-2, -1)
@@ -1058,8 +1140,11 @@ class _KFACReduce:
             if self._profile_enabled:
                 solve_out_start = time.perf_counter()
             if self.cfg.use_inverse_factors:
-                tmp2 = torch.bmm(lg_inv_batch.transpose(-2, -1), x_hat)
+                x_hat_out = x_hat if x_hat.dtype == inv_compute_dtype else x_hat.to(dtype=inv_compute_dtype)
+                tmp2 = torch.bmm(lg_inv_batch.transpose(-2, -1), x_hat_out)
                 x_batch = torch.bmm(tmp2, la_inv_batch)
+                if x_batch.dtype != torch.float32:
+                    x_batch = x_batch.float()
             else:
                 tmp2 = torch.linalg.solve_triangular(lg_batch.transpose(-2, -1), x_hat, upper=True)
                 x_batch = torch.linalg.solve_triangular(
@@ -1072,6 +1157,7 @@ class _KFACReduce:
 
             if self._profile_enabled:
                 unpack_start = time.perf_counter()
+            step_lrs = []
             for idx, module in enumerate(meta_modules):
                 step = x_batch[idx].reshape_as(module.weight)
                 step_lr = _adjust_muon_lr(
@@ -1079,10 +1165,16 @@ class _KFACReduce:
                     tuple(p_batch[idx].shape),
                     mode=self.cfg.lr_adjustment,
                 )
+                step_lrs.append(step_lr)
                 steps_for_params.append((module.weight, step, lr, step_lr))
-                muon_ref_step = muon_ref_batch[idx].reshape_as(module.weight)
-                muon_ref_sq_norm += float((muon_ref_step.float() * float(step_lr)).square().sum().item())
                 param_numel_total += int(module.weight.numel())
+            if muon_ref_batch is not None and step_lrs:
+                step_lrs_t = torch.tensor(step_lrs, device=muon_ref_batch.device, dtype=torch.float32).view(-1, 1, 1)
+                muon_ref_sq_batch = (muon_ref_batch.float() * step_lrs_t).square().sum()
+                if muon_ref_sq_norm_t is None:
+                    muon_ref_sq_norm_t = muon_ref_sq_batch
+                else:
+                    muon_ref_sq_norm_t = muon_ref_sq_norm_t + muon_ref_sq_batch
             if self._profile_enabled:
                 t_unpack_total += time.perf_counter() - unpack_start
 
@@ -1097,21 +1189,37 @@ class _KFACReduce:
                 for param, step, wd_lr, step_lr in steps_for_params
             ]
 
-        applied_sq_norm = 0.0
-        for _, step, _, step_lr in steps_for_params:
-            applied_sq_norm += float((step.float() * float(step_lr)).square().sum().item())
+        if steps_for_params:
+            applied_sq_norm_t = torch.zeros((), device=steps_for_params[0][0].device, dtype=torch.float32)
+            for _, step, _, step_lr in steps_for_params:
+                applied_sq_norm_t += (step.float() * float(step_lr)).square().sum()
+            applied_sq_norm = float(applied_sq_norm_t.item())
+        else:
+            applied_sq_norm = 0.0
         applied_step_norm = math.sqrt(max(applied_sq_norm, 0.0))
-        muon_ref_step_norm = math.sqrt(max(muon_ref_sq_norm, 0.0))
+
+        if self.cfg.track_muon_reference:
+            muon_ref_sq_norm = float(muon_ref_sq_norm_t.item()) if muon_ref_sq_norm_t is not None else 0.0
+            muon_ref_step_norm = math.sqrt(max(muon_ref_sq_norm, 0.0))
+        else:
+            muon_ref_step_norm = float('nan')
+
         self._last_applied_step_norm = applied_step_norm
         self._last_muon_ref_step_norm = muon_ref_step_norm
-        self._last_step_vs_muon_ref_ratio = applied_step_norm / max(muon_ref_step_norm, 1e-12)
+        if self.cfg.track_muon_reference:
+            self._last_step_vs_muon_ref_ratio = applied_step_norm / max(muon_ref_step_norm, 1e-12)
+        else:
+            self._last_step_vs_muon_ref_ratio = float('nan')
         if param_numel_total > 0:
             denom = math.sqrt(float(param_numel_total))
             self._last_applied_step_rms = applied_step_norm / denom
-            self._last_muon_ref_step_rms = muon_ref_step_norm / denom
+            if self.cfg.track_muon_reference:
+                self._last_muon_ref_step_rms = muon_ref_step_norm / denom
+            else:
+                self._last_muon_ref_step_rms = float('nan')
         else:
             self._last_applied_step_rms = 0.0
-            self._last_muon_ref_step_rms = 0.0
+            self._last_muon_ref_step_rms = 0.0 if self.cfg.track_muon_reference else float('nan')
 
         if self._profile_enabled:
             self._prof_add('kfac_solve_pack_s', t_pack_total)
@@ -1337,7 +1445,9 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
                         dtype=torch.float32,
                     )
             self._kfac._stats_initialized[module] = bool(saved.get('stats_initialized', True))
+            self._kfac._factors_dirty[module] = not self._kfac._stats_initialized[module]
             self._kfac._refresh_inverse_factors(module)
+        self._kfac._last_factor_damping = float(self._kfac.cfg.damping)
 
     def load_state_dict(self, state_dict):
         kfac_state = state_dict.pop('kfac_reduce_state', None)
@@ -1373,19 +1483,35 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
         kfac_steps = self._kfac.compute_steps(muon_lr)
         if self._profile_enabled:
             self._profile_totals['kfac_compute_steps_s'] += time.perf_counter() - t1
-        grad_step_dot = 0.0
-        grad_sq_norm = 0.0
-        step_sq_norm = 0.0
+        grad_step_dot_t = None
+        grad_sq_norm_t = None
+        step_sq_norm_t = None
         grad_numel = 0
         for param, step, _, step_lr in kfac_steps:
             if param.grad is None:
                 continue
             grad = param.grad.float()
             delta = step.float() * float(step_lr)
-            grad_step_dot += float((grad * delta).sum().item())
-            grad_sq_norm += float(grad.square().sum().item())
-            step_sq_norm += float(delta.square().sum().item())
+            dot_contrib = (grad * delta).sum()
+            grad_sq_contrib = grad.square().sum()
+            step_sq_contrib = delta.square().sum()
+            if grad_step_dot_t is None:
+                grad_step_dot_t = dot_contrib
+                grad_sq_norm_t = grad_sq_contrib
+                step_sq_norm_t = step_sq_contrib
+            else:
+                grad_step_dot_t = grad_step_dot_t + dot_contrib
+                grad_sq_norm_t = grad_sq_norm_t + grad_sq_contrib
+                step_sq_norm_t = step_sq_norm_t + step_sq_contrib
             grad_numel += int(grad.numel())
+        if grad_step_dot_t is None:
+            grad_step_dot = 0.0
+            grad_sq_norm = 0.0
+            step_sq_norm = 0.0
+        else:
+            grad_step_dot = float(grad_step_dot_t.item())
+            grad_sq_norm = float(grad_sq_norm_t.item())
+            step_sq_norm = float(step_sq_norm_t.item())
         self._last_kfac_grad_step_dot = grad_step_dot
         # Chapter-6 LM uses M(delta)-M(0)=0.5 * grad^T delta (for the chosen delta).
         self._last_kfac_model_delta = 0.5 * grad_step_dot
@@ -1534,6 +1660,11 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         )
 
     eps = 1e-8 if args.opt_eps is None else args.opt_eps
+    if args.kfac_inverse_compute_dtype != 'float32' and not args.kfac_use_inverse_factors:
+        _logger.warning(
+            '--kfac-inverse-compute-dtype=%s is ignored unless --kfac-use-inverse-factors is enabled.',
+            args.kfac_inverse_compute_dtype,
+        )
     kfac_cfg = _KFACConfig(
         damping=args.kfac_damping,
         pi_scale=args.kfac_pi_scale,
@@ -1550,6 +1681,9 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         weight_decay=args.weight_decay,
         max_step_norm=args.kfac_max_step_norm,
         use_inverse_factors=args.kfac_use_inverse_factors,
+        inverse_compute_dtype=args.kfac_inverse_compute_dtype,
+        refresh_factors_on_stats_update=args.kfac_refresh_factors_on_stats_update,
+        track_muon_reference=args.kfac_track_muon_reference,
     )
     return KFACMuonOptimizer(
         model=model,
@@ -2979,15 +3113,34 @@ def train_one_epoch(
         )
         if kfac_step_executed:
             kfac_step_events += 1
-            kfac_effective_ratio_m.update(optimizer.get_last_kfac_effective_step_ratio())
-            kfac_step_norm_m.update(optimizer.get_last_kfac_step_norm())
-            kfac_grad_norm_m.update(optimizer.get_last_kfac_grad_norm())
-            kfac_step_rms_m.update(optimizer.get_last_kfac_step_rms())
-            kfac_grad_rms_m.update(optimizer.get_last_kfac_grad_rms())
-            kfac_grad_step_cos_m.update(optimizer.get_last_kfac_grad_step_cos())
-            kfac_vs_muon_step_ratio_m.update(optimizer.get_last_kfac_vs_muon_step_ratio())
-            kfac_muon_ref_step_norm_m.update(optimizer.get_last_kfac_muon_ref_step_norm())
-            kfac_muon_ref_step_rms_m.update(optimizer.get_last_kfac_muon_ref_step_rms())
+            eff_ratio = optimizer.get_last_kfac_effective_step_ratio()
+            step_norm = optimizer.get_last_kfac_step_norm()
+            grad_norm = optimizer.get_last_kfac_grad_norm()
+            step_rms = optimizer.get_last_kfac_step_rms()
+            grad_rms = optimizer.get_last_kfac_grad_rms()
+            grad_step_cos = optimizer.get_last_kfac_grad_step_cos()
+            vs_muon_ratio = optimizer.get_last_kfac_vs_muon_step_ratio()
+            muon_ref_norm = optimizer.get_last_kfac_muon_ref_step_norm()
+            muon_ref_rms = optimizer.get_last_kfac_muon_ref_step_rms()
+
+            if math.isfinite(eff_ratio):
+                kfac_effective_ratio_m.update(eff_ratio)
+            if math.isfinite(step_norm):
+                kfac_step_norm_m.update(step_norm)
+            if math.isfinite(grad_norm):
+                kfac_grad_norm_m.update(grad_norm)
+            if math.isfinite(step_rms):
+                kfac_step_rms_m.update(step_rms)
+            if math.isfinite(grad_rms):
+                kfac_grad_rms_m.update(grad_rms)
+            if math.isfinite(grad_step_cos):
+                kfac_grad_step_cos_m.update(grad_step_cos)
+            if math.isfinite(vs_muon_ratio):
+                kfac_vs_muon_step_ratio_m.update(vs_muon_ratio)
+            if math.isfinite(muon_ref_norm):
+                kfac_muon_ref_step_norm_m.update(muon_ref_norm)
+            if math.isfinite(muon_ref_rms):
+                kfac_muon_ref_step_rms_m.update(muon_ref_rms)
 
         if use_kfac_lm_this_update:
             if kfac_step_executed and kfac_lm_pre_loss_weight > 0.0 and kfac_lm_replay_batches:
@@ -3092,10 +3245,17 @@ def train_one_epoch(
 
             kfac_diag = ''
             if is_kfac_optimizer and kfac_step_events > 0:
+                if kfac_vs_muon_step_ratio_m.count > 0:
+                    vs_muon_diag = (
+                        f'{kfac_vs_muon_step_ratio_m.val:.3e} '
+                        f'({kfac_vs_muon_step_ratio_m.avg:.3e})'
+                    )
+                else:
+                    vs_muon_diag = 'nan (nan)'
                 kfac_diag = (
                     f'  KFAC |delta|/|g|: {kfac_effective_ratio_m.val:.3e} ({kfac_effective_ratio_m.avg:.3e})  '
                     f'|delta|_rms: {kfac_step_rms_m.val:.3e} ({kfac_step_rms_m.avg:.3e})  '
-                    f'|delta|/|delta_muon|: {kfac_vs_muon_step_ratio_m.val:.3e} ({kfac_vs_muon_step_ratio_m.avg:.3e})'
+                    f'|delta|/|delta_muon|: {vs_muon_diag}'
                 )
 
             if utils.is_primary(args):
@@ -3182,9 +3342,21 @@ def train_one_epoch(
             metrics['kfac_step_rms'] = float(kfac_step_rms_m.avg)
             metrics['kfac_grad_rms'] = float(kfac_grad_rms_m.avg)
             metrics['kfac_grad_step_cos'] = float(kfac_grad_step_cos_m.avg)
-            metrics['kfac_vs_muon_step_ratio'] = float(kfac_vs_muon_step_ratio_m.avg)
-            metrics['kfac_muon_ref_step_norm'] = float(kfac_muon_ref_step_norm_m.avg)
-            metrics['kfac_muon_ref_step_rms'] = float(kfac_muon_ref_step_rms_m.avg)
+            metrics['kfac_vs_muon_step_ratio'] = (
+                float(kfac_vs_muon_step_ratio_m.avg)
+                if kfac_vs_muon_step_ratio_m.count > 0
+                else float('nan')
+            )
+            metrics['kfac_muon_ref_step_norm'] = (
+                float(kfac_muon_ref_step_norm_m.avg)
+                if kfac_muon_ref_step_norm_m.count > 0
+                else float('nan')
+            )
+            metrics['kfac_muon_ref_step_rms'] = (
+                float(kfac_muon_ref_step_rms_m.avg)
+                if kfac_muon_ref_step_rms_m.count > 0
+                else float('nan')
+            )
         else:
             metrics['kfac_eff_step_ratio'] = float('nan')
             metrics['kfac_step_norm'] = float('nan')
