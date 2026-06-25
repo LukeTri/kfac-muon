@@ -1,0 +1,5 @@
+dataset,model,optimizer,epochs,best_epoch,best_top1,final_top1,best_loss,final_loss
+CIFAR-100,ViT-S/16,Muon,75,74,73.5300,73.5300,1.166680,1.166680
+CIFAR-100,ViT-S/16,KFAC-Muon,75,74,75.7000,75.7000,1.084485,1.084485
+ImageNet-100,ViT-B/16,Muon,90,89,82.3000,82.3000,0.854322,0.854322
+ImageNet-100,ViT-B/16,KFAC-Muon,90,89,84.0600,84.0600,0.807218,0.807218

@@ -294,9 +294,9 @@ group.add_argument('--kfac-track-muon-reference', dest='kfac_track_muon_referenc
 group.add_argument('--no-kfac-track-muon-reference', dest='kfac_track_muon_reference', action='store_false',
                    help='Disable plain-Muon reference step metrics in --opt kfac_muon to reduce overhead.')
 group.add_argument('--kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_true',
-                   help='Exclude first and last affine layers from KFAC-Muon set (default: enabled)')
+                   help='Exclude first and last affine layers from KFAC-Muon set (default: disabled)')
 group.add_argument('--no-kfac-exclude-first-last', dest='kfac_exclude_first_last', action='store_false',
-                   help='Include first and last affine layers in KFAC-Muon set')
+                   help='Include first and last affine layers in KFAC-Muon set (default)')
 group.add_argument('--kfac-aux-no-decay', dest='kfac_aux_no_decay', action='store_true',
                    help='Use no-weight-decay rules for auxiliary AdamW params in --opt kfac_muon (default: enabled)')
 group.add_argument('--no-kfac-aux-no-decay', dest='kfac_aux_no_decay', action='store_false',
@@ -323,7 +323,7 @@ group.add_argument('--no-fismo-aux-no-decay', dest='fismo_aux_no_decay', action=
                    help='Apply weight decay to all auxiliary AdamW params in --opt fismo')
 parser.set_defaults(
     kfac_nesterov=True,
-    kfac_exclude_first_last=True,
+    kfac_exclude_first_last=False,
     kfac_aux_no_decay=True,
     kfac_refresh_factors_on_stats_update=False,
     kfac_track_muon_reference=True,
@@ -1247,7 +1247,7 @@ class KFACMuonOptimizer(torch.optim.Optimizer):
             betas: tuple[float, float] = (0.9, 0.95),
             eps: float = 1e-8,
             aux_no_decay: bool = True,
-            exclude_first_last: bool = True,
+            exclude_first_last: bool = False,
             kfac_cfg: Optional[_KFACConfig] = None,
     ):
         if kfac_cfg is None:

@@ -48,7 +48,7 @@ run_base() {
 
 if [[ "$STAGE" == "rank75" ]]; then
   # Focused KFAC ranking set (no muon runs).
-  RANK_CASES="${RANK_CASES:-kfac_vit_base,kfac_rho_wide,kfac_wd005,kfac_dp005,kfac_eps0055,kfac_lr_high,kfac_lr_low,kfac_lmoff,kfac_damp_5e5,kfac_damp_2e4}"
+  RANK_CASES="${RANK_CASES:-kfac_vit_base,kfac_rho_wide,kfac_wd005,kfac_dp005,kfac_eps0055,kfac_lr_high,kfac_lr_low,kfac_lmoff,kfac_lmoff_damp_5e5,kfac_damp_5e5,kfac_damp_2e4}"
   RANK_SEEDS="${SEEDS:-12}"
   echo "==> Stage: rank75"
   echo "==> Cases: $RANK_CASES"

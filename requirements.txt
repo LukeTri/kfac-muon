@@ -1,7 +1,7 @@
-# Minimal requirements for vit_imagenette_stage1_muon_kfac.py
-# Note: on Vast.ai, install a CUDA-matching PyTorch build if torch is not already present.
+# Minimal requirements for KFAC/Muon training scripts.
+# Note: install a CUDA 12.8 PyTorch build first when running on GPU hosts.
 # Example:
-#   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
 # Then install the remaining requirements from this file.
 
 numpy>=1.24

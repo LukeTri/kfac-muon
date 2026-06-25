@@ -55,7 +55,7 @@ if [[ "$PHASE" == "pilot" ]]; then
   EPOCHS="${EPOCHS:-75}"
   BASE_MIXUP_OFF_EPOCH="${BASE_MIXUP_OFF_EPOCH:-56}"
   DEFAULT_SEEDS="${DEFAULT_SEEDS:-12}"
-  DEFAULT_CASES="muon_fixed,muon_lr_low,muon_lr_high,kfac_vit_base,kfac_lr_low,kfac_lr_high,kfac_lmoff,kfac_rho_wide,kfac_damp_5e5,kfac_eps0055,kfac_dp005,kfac_wd005"
+  DEFAULT_CASES="muon_fixed,muon_lr_low,muon_lr_high,kfac_vit_base,kfac_lr_low,kfac_lr_high,kfac_lmoff,kfac_lmoff_damp_5e5,kfac_rho_wide,kfac_damp_5e5,kfac_eps0055,kfac_dp005,kfac_wd005"
 elif [[ "$PHASE" == "full" ]]; then
   EPOCHS="${EPOCHS:-200}"
   BASE_MIXUP_OFF_EPOCH="${BASE_MIXUP_OFF_EPOCH:-140}"
@@ -198,6 +198,15 @@ for seed in $SEEDS_STR; do
     run_train "vits16_c100_kfac_lmoff_e${EPOCHS}_s${seed}" "$seed" \
       --opt kfac_muon --lr "$KFAC_LR_FIXED" \
       --kfac-damping "$KFAC_DAMPING_BASE" --kfac-momentum "$KFAC_MOMENTUM_BASE" --kfac-nesterov \
+      --kfac-muon-eps "$KFAC_EPS_BASE" --kfac-muon-lr-adjustment "$KFAC_LR_ADJUSTMENT_BASE" \
+      --kfac-stats-update-every "$KFAC_STATS_EVERY_BASE" --kfac-factor-update-every "$KFAC_FACTOR_EVERY_BASE" \
+      --no-kfac-lm-adapt-damping --kfac-aux-no-decay
+  fi
+
+  if contains_case "kfac_lmoff_damp_5e5"; then
+    run_train "vits16_c100_kfac_lmoff_damp5e5_e${EPOCHS}_s${seed}" "$seed" \
+      --opt kfac_muon --lr "$KFAC_LR_FIXED" \
+      --kfac-damping 5e-5 --kfac-momentum "$KFAC_MOMENTUM_BASE" --kfac-nesterov \
       --kfac-muon-eps "$KFAC_EPS_BASE" --kfac-muon-lr-adjustment "$KFAC_LR_ADJUSTMENT_BASE" \
       --kfac-stats-update-every "$KFAC_STATS_EVERY_BASE" --kfac-factor-update-every "$KFAC_FACTOR_EVERY_BASE" \
       --no-kfac-lm-adapt-damping --kfac-aux-no-decay
