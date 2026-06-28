@@ -853,12 +853,17 @@ class _KFACReduce:
         self._hooks = []
 
         def fwd_hook(module: nn.Module, inputs, output):
+            cache = self._cache.get(module)
+            if cache is None:
+                # Model EMA/deepcopy can copy hooks to cloned modules that are not
+                # owned by this KFAC reducer. Ignore those forwards.
+                return
             activations = inputs[0].detach()
-            self._cache[module]['a'] = activations
-            self._cache[module]['g'] = None
+            cache['a'] = activations
+            cache['g'] = None
             if output.requires_grad:
                 def store_grad(grad_out: torch.Tensor):
-                    self._cache[module]['g'] = grad_out.detach()
+                    cache['g'] = grad_out.detach()
                 output.register_hook(store_grad)
 
         for module in self.modules:
