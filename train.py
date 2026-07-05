@@ -30,6 +30,7 @@ from functools import partial
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.utils
@@ -289,6 +290,10 @@ group.add_argument('--kfac-refresh-factors-on-stats-update', dest='kfac_refresh_
 group.add_argument('--no-kfac-refresh-factors-on-stats-update', dest='kfac_refresh_factors_on_stats_update',
                    action='store_false',
                    help='Do not refresh KFAC factors on every stats update; refresh on factor cadence instead.')
+group.add_argument('--kfac-sync-stats', dest='kfac_sync_stats', action='store_true',
+                   help='All-reduce KFAC activation/error factors across distributed ranks (default: enabled).')
+group.add_argument('--no-kfac-sync-stats', dest='kfac_sync_stats', action='store_false',
+                   help='Use rank-local KFAC activation/error factors in distributed training.')
 group.add_argument('--kfac-track-muon-reference', dest='kfac_track_muon_reference', action='store_true',
                    help='Track plain-Muon reference step metrics in --opt kfac_muon (default: enabled).')
 group.add_argument('--no-kfac-track-muon-reference', dest='kfac_track_muon_reference', action='store_false',
@@ -326,6 +331,7 @@ parser.set_defaults(
     kfac_exclude_first_last=False,
     kfac_aux_no_decay=True,
     kfac_refresh_factors_on_stats_update=False,
+    kfac_sync_stats=True,
     kfac_track_muon_reference=True,
     kfac_lm_adapt_damping=True,
     fismo_exclude_first_last=True,
@@ -729,6 +735,7 @@ class _KFACConfig:
     use_inverse_factors: bool = False
     inverse_compute_dtype: str = 'float32'
     refresh_factors_on_stats_update: bool = False
+    sync_stats: bool = True
     track_muon_reference: bool = True
 
 
@@ -980,6 +987,32 @@ class _KFACReduce:
         g_batch = (g_sum.transpose(0, 1) @ g_sum) * batch_size
         return self._sym(a_batch), self._sym(g_batch)
 
+    def _sync_factor_batch(
+            self,
+            a_batch: torch.Tensor,
+            g_batch: torch.Tensor,
+            local_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+                not self.cfg.sync_stats
+                or not dist.is_available()
+                or not dist.is_initialized()
+                or dist.get_world_size() <= 1
+        ):
+            return a_batch, g_batch
+
+        # Local factors are normalized by the local batch. Weight by local
+        # batch size, sum across ranks, then divide by global batch size to
+        # match the factor from the combined distributed mini-batch.
+        batch = torch.tensor(float(local_batch_size), device=a_batch.device, dtype=torch.float32)
+        a_batch = a_batch * batch
+        g_batch = g_batch * batch
+        dist.all_reduce(a_batch, op=dist.ReduceOp.SUM)
+        dist.all_reduce(g_batch, op=dist.ReduceOp.SUM)
+        dist.all_reduce(batch, op=dist.ReduceOp.SUM)
+        denom = batch.clamp_min(1.0)
+        return self._sym(a_batch / denom), self._sym(g_batch / denom)
+
     @torch.no_grad()
     def maybe_update_stats(self) -> None:
         self._step += 1
@@ -1006,6 +1039,11 @@ class _KFACReduce:
                 a_batch, g_batch = self._conv2d_reduce_factors(module, activations, grads)
             else:
                 raise TypeError(f'Unsupported module type: {type(module)}')
+            a_batch, g_batch = self._sync_factor_batch(
+                a_batch,
+                g_batch,
+                local_batch_size=int(activations.shape[0]),
+            )
 
             if needs_bootstrap:
                 # First real observation for this module: initialize directly from data
@@ -1688,6 +1726,7 @@ def _create_kfac_muon_optimizer(model: nn.Module, args) -> KFACMuonOptimizer:
         use_inverse_factors=args.kfac_use_inverse_factors,
         inverse_compute_dtype=args.kfac_inverse_compute_dtype,
         refresh_factors_on_stats_update=args.kfac_refresh_factors_on_stats_update,
+        sync_stats=args.kfac_sync_stats,
         track_muon_reference=args.kfac_track_muon_reference,
     )
     return KFACMuonOptimizer(
