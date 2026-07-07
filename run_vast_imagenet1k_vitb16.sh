@@ -79,6 +79,9 @@ EXPERIMENT="${EXPERIMENT:-vitb16_in1k_${MODE}_e${EPOCHS}_lr${LR}_b${BATCH_SIZE}_
 LOG_INTERVAL="${LOG_INTERVAL:-200}"
 VAL_INTERVAL="${VAL_INTERVAL:-1}"
 CHECKPOINT_HIST="${CHECKPOINT_HIST:-2}"
+# By default keep recent checkpoints so long VAST runs can be resumed.
+# Set CHECKPOINT_FINAL_ONLY=1 to save only at the final epoch.
+CHECKPOINT_FINAL_ONLY="${CHECKPOINT_FINAL_ONLY:-0}"
 
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -131,6 +134,12 @@ CMD=(
   --output "$OUTPUT"
   --experiment "$EXPERIMENT"
 )
+
+if [[ "$CHECKPOINT_FINAL_ONLY" == "1" ]]; then
+  CMD+=(--checkpoint-final-only)
+else
+  CMD+=(--no-checkpoint-final-only)
+fi
 
 if [[ "$AMP" == "1" ]]; then
   CMD+=(--amp --amp-dtype "$AMP_DTYPE")
