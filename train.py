@@ -608,6 +608,63 @@ def _maybe_apply_image_folder_defaults(args) -> None:
                 )
 
 
+class _LocalRepeatAugDataset(torch.utils.data.Dataset):
+    """Single-process repeated augmentation wrapper.
+
+    This mirrors the key sampling behavior of DeiT/timm repeat augmentation
+    without requiring distributed training: build a repeated, shuffled index
+    list, then keep the selected epoch length close to the base dataset length.
+    Each duplicate index is fetched independently, so stochastic transforms
+    produce different views.
+    """
+
+    def __init__(self, dataset: torch.utils.data.Dataset, num_repeats: int = 3, selected_round: int = 256):
+        if num_repeats < 1:
+            raise ValueError(f'num_repeats must be >= 1, got {num_repeats}')
+        self.dataset = dataset
+        self.num_repeats = int(num_repeats)
+        self.selected_round = int(max(1, selected_round))
+        self.epoch = 0
+        self._indices = None
+        selected = (len(dataset) // self.selected_round) * self.selected_round
+        self.num_selected_samples = selected if selected > 0 else len(dataset)
+
+    @property
+    def transform(self):
+        return getattr(self.dataset, 'transform', None)
+
+    @transform.setter
+    def transform(self, value):
+        setattr(self.dataset, 'transform', value)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self._indices = None
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(epoch)
+
+    def _make_indices(self) -> list[int]:
+        generator = torch.Generator()
+        generator.manual_seed(self.epoch)
+        indices = torch.randperm(len(self.dataset), generator=generator)
+        indices = torch.repeat_interleave(indices, repeats=self.num_repeats).tolist()
+        if len(indices) < self.num_selected_samples:
+            repeat_count = math.ceil(self.num_selected_samples / max(1, len(indices)))
+            indices = (indices * repeat_count)[:self.num_selected_samples]
+        return indices[:self.num_selected_samples]
+
+    def _get_indices(self) -> list[int]:
+        if self._indices is None:
+            self._indices = self._make_indices()
+        return self._indices
+
+    def __len__(self) -> int:
+        return self.num_selected_samples
+
+    def __getitem__(self, index: int):
+        return self.dataset[self._get_indices()[index]]
+
+
 def _candidate_affine_modules(model: nn.Module) -> list[nn.Module]:
     modules = []
     for module in model.modules():
@@ -2334,6 +2391,21 @@ def main():
         num_samples=args.train_num_samples,
         trust_remote_code=args.dataset_trust_remote_code,
     )
+    local_repeat_aug = (
+            args.aug_repeats > 0
+            and not args.distributed
+            and not isinstance(dataset_train, torch.utils.data.IterableDataset)
+    )
+    loader_aug_repeats = args.aug_repeats
+    if local_repeat_aug:
+        dataset_train = _LocalRepeatAugDataset(dataset_train, num_repeats=int(args.aug_repeats))
+        loader_aug_repeats = 0
+        if utils.is_primary(args):
+            _logger.info(
+                'Using local repeated augmentation wrapper: repeats=%s, selected_samples=%s',
+                args.aug_repeats,
+                len(dataset_train),
+            )
 
     dataset_eval = None
     if args.val_split:
@@ -2386,7 +2458,7 @@ def main():
         grayscale_prob=args.grayscale_prob,
         gaussian_blur_prob=args.gaussian_blur_prob,
         auto_augment=args.aa,
-        num_aug_repeats=args.aug_repeats,
+        num_aug_repeats=loader_aug_repeats,
         num_aug_splits=num_aug_splits,
         interpolation=train_interpolation,
         num_workers=args.workers,
